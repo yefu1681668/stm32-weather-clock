@@ -145,8 +145,8 @@ Program Size: Code=12908  RO-data=31844  RW-data=220  ZI-data=17684
 
 ## 当前进度与后续计划
 
-- [x] 裸机版 → FreeRTOS 重构，编译 0 Error / 0 Warning，任务调度正常
-- [x] 联网天气 / SNTP 对时 / 姿态翻转 / RTC 走时功能保留
+- [x] 裸机版 → FreeRTOS 重构，Keil 编译 0 Error / 0 Warning（**待真机复验**）
+- [x] 联网天气 / SNTP 对时 / 姿态翻转 / RTC 走时功能的代码完整迁移（同上，待复验）
 - [ ] 图标外置到 W25Q（释放 27 KB Flash）
 - [ ] 移植 OTA BootLoader（`0x08000000` 16 KB Boot + `0x08004000` APP）
 - [ ] 多任务重构：网络任务 / UI 任务 / 传感器任务拆分，改为队列通信（当前为单任务轮询）
