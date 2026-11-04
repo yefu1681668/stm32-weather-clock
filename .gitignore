@@ -2,6 +2,9 @@
 mdk/Objects/
 mdk/Listings/
 mdk/DebugConfig/
+mdk/build.log
+build.log
+*.log
 *.o
 *.d
 *.crf
