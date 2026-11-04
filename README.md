@@ -127,19 +127,21 @@ weather_clock/
 ## 资源占用（实测，Keil V5.06 编译结果）
 
 ```
-Program Size: Code=12924  RO-data=31840  RW-data=220  ZI-data=17684
+Program Size: Code=12908  RO-data=31844  RW-data=220  ZI-data=17684
 ```
 
 | 项目 | 占用 | 总容量 | 使用率 |
 |---|---|---|---|
-| Flash（Code + RO + RW） | 44 984 B ≈ **43.9 KB** | 64 KB | 68.6% |
+| Flash（Code + RO + RW） | 44 972 B ≈ **43.9 KB** | 64 KB | 68.7% |
 | RAM（RW + ZI） | 17 904 B ≈ **17.5 KB** | 20 KB | 87.4% |
+
+> 数值含本地 WiFi 账号字符串，换用不同长度的 SSID 会有几十字节偏差。
 
 **空间分析（决定了后续改造路线）**
 
 - `RO-data` 中 **27 648 B（27 KB）是 6 张天气图标**（48×48 RGB565），占 Flash 的 62%，占 RO-data 的 87%。若迁移到外部 SPI Flash，Flash 占用可降到约 17 KB。
 - RAM 仅剩 **2.5 KB**。若直接移植 OTA BootLoader 并与 APP 共享缓冲区，极易栈溢出，需重新核算任务栈与堆。
-- 若套用 16 KB Boot + 47 KB APP 的 OTA 分区，APP 可用 48 128 B，当前 44 984 B 仅余 **3.1 KB**，加任何功能都会溢出。
+- 若套用 16 KB Boot + 47 KB APP 的 OTA 分区，APP 可用 48 128 B，当前 44 972 B 仅余 **3.1 KB**，加任何功能都会溢出。
 
 ## 当前进度与后续计划
 
