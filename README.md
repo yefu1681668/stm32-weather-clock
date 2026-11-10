@@ -6,6 +6,10 @@
 
 > **状态：全部功能已在真机验证通过**（2026-11-10），详见文末「真机验证记录」。
 
+![实物接线：STM32F103C8T6 + ST7735 彩屏 + ESP32-C3 面包板系统](docs/hardware.jpg)
+
+> 实物照片：面包板上的 C8T6、ST7735 彩屏、ESP32-C3 与杜邦线连接。照片中的 WiFi 名称已脱敏。
+
 ---
 
 ## 功能特性
@@ -110,6 +114,7 @@ weather_clock/
 │   └── Src/                 main.c / gpio.c / usart.c / stm32f1xx_it.c
 ├── Drivers/                 STM32F1 HAL 库 + CMSIS（ST 官方，未改动）
 ├── FreeRTOS/                内核源码（tasks / queue / list）+ heap_4 + ARM_CM3 port
+├── docs/                    真机实物照片（hardware.jpg / screen.jpg）
 └── mdk/                     Keil MDK 工程
     ├── Freertos的嵌入式智能天气时钟.uvprojx
     ├── app/                 应用层：天气解析、字库、开机动画、图标
@@ -172,7 +177,9 @@ Program Size: Code=13044  RO-data=32052  RW-data=220  ZI-data=17684
 
 ## 真机验证记录（2026-11-10）
 
-在 STM32F103C8T6 + ST7735 + ESP32-C3 实物上完成，屏幕实测显示：
+在 STM32F103C8T6 + ST7735 + ESP32-C3 实物上完成，屏幕实测显示（状态栏 WiFi 名称已脱敏为 `<SSID>`）：
+
+![屏幕特写：状态栏、时间、日期、湿度与气温面板](docs/screen.jpg)
 
 ```
 状态栏   <SSID> | 桂林       ← WiFi 已连接
