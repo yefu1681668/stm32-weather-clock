@@ -61,10 +61,14 @@ extern uint32_t esp_at_last_rxlen;
 #define W_PANEL     64
 
 /* ---------- 任务参数 ----------
- * 优先级: start(4) > ui(3) > net(2) > heartbeat(1)
- *   ui 最高 —— 时间刷新必须准时, 不能被 HTTP 的 10s 忙等拖住;
- *   net 次之 —— 网络慢只拖自己, 队列解耦后不会冻屏;
- *   heartbeat 最低 —— 纯指示, 偶尔抢不到 CPU 也无妨。
+ * 优先级: heartbeat(4) = start(4) > ui(3) > net(2) > idle(0)
+ *   heartbeat 最高 —— 它是"系统还活着"的指示器, 必须独立于任何业务负载。
+ *                     esp_at_send_command() 是 1ms 粒度的忙等(最长 20s),
+ *                     若把心跳放在 net 之下, 联网一旦卡住就会被完全饿死:
+ *                     屏幕冒号照闪(ui 能抢占), 唯独 LED 不动。
+ *   ui 次之     —— 时间刷新不能被 HTTP 拖住;
+ *   net 最低     —— 网络慢只拖自己, 队列解耦后不会冻屏。
+ * start 只在启动期存在(建完三个任务即自删), 与 heartbeat 同为 P4 无冲突。
  * 三个任务栈都从已有 ucHeap(8KB) 分配, 不新增静态 RAM。 */
 #define START_TASK_STACK        128
 #define START_TASK_PRIORITY     4
@@ -73,7 +77,7 @@ extern uint32_t esp_at_last_rxlen;
 #define NET_TASK_STACK          384
 #define NET_TASK_PRIORITY       2
 #define HEARTBEAT_TASK_STACK    128
-#define HEARTBEAT_TASK_PRIORITY 1
+#define HEARTBEAT_TASK_PRIORITY 4
 
 /* ---------- 任务间通信 ---------- */
 typedef enum {
@@ -329,6 +333,16 @@ static void draw_image_scaled(uint16_t x, uint16_t y,
 
 /* ---------- FreeRTOS启动 ---------- */
 
+/* 驱动层每等待 1ms 回调一次: 把忙等换成挂起一个 tick, 主动让出 CPU。
+ * configTICK_RATE_HZ = 1000, 任务总在 tick 边界被唤醒, 之后每次
+ * vTaskDelay(1) 都跨过完整一个 tick, 所以 esp_at 的 timeout 计数
+ * 仍近似毫秒, 不会把 20s 的 CWJAP 上限意外缩短。
+ * 注意: 只能由任务上下文调用; 本项目所有 AT 命令都发在 net_task 里。 */
+static void net_wait_1ms(void)
+{
+    vTaskDelay(1);
+}
+
 void freertos_start(void)
 {
     /* 三个同步对象必须在调度器启动前创建(此时还不能用任务间 API)。
@@ -337,6 +351,9 @@ void freertos_start(void)
     g_weather_q = xQueueCreate(6, sizeof(weather_msg_t));
     g_lcd_mutex = xSemaphoreCreateMutex();
     g_lcd_ready = xSemaphoreCreateBinary();   /* 初值 0: UI 初始化完屏才 give */
+
+    /* 注册让出回调: esp_at 驱动保持零 RTOS 依赖, 但长超时等待不再霸占 CPU */
+    esp_at_set_wait_hook(net_wait_1ms);
 
     if (g_weather_q == NULL || g_lcd_mutex == NULL || g_lcd_ready == NULL)
     {
@@ -366,7 +383,7 @@ static void start_task(void *pvParameters)
     /* ===== 心跳1: 进入调度器后会慢闪 3 次(300ms 亮/灭) =====
      * 完全不闪 => 程序根本没跑起来(没烧进去 / 时钟或HardFault),
      *             与屏幕、接线无关, 应先查烧录。
-     * 慢闪3次后停住 => 调度器在跑, 但下面创建任务失败(堆不足)。*/
+     * 慢闪3次后转为 100ms 快闪 => 下面某个任务创建失败(ucHeap 不足)。*/
     led_init();
     for (uint8_t i = 0; i < 3; i++)
     {
@@ -376,26 +393,44 @@ static void start_task(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 
-    xTaskCreate((TaskFunction_t)ui_task,
-                (char *)"ui_task",
-                (configSTACK_DEPTH_TYPE)UI_TASK_STACK,
-                (void *)NULL,
-                (UBaseType_t)UI_TASK_PRIORITY,
-                (TaskHandle_t *)&ui_task_handle);
+    /* 必须检查返回值: 原来三个 xTaskCreate 都丢弃了结果, 一旦 8KB 堆不够,
+     * heartbeat_task 会静默创建失败 —— 表现就是"冒号闪但 LED 完全不闪",
+     * 极易被误判成 LED 硬件或接线故障。 */
+    BaseType_t created = pdPASS;
 
-    xTaskCreate((TaskFunction_t)net_task,
-                (char *)"net_task",
-                (configSTACK_DEPTH_TYPE)NET_TASK_STACK,
-                (void *)NULL,
-                (UBaseType_t)NET_TASK_PRIORITY,
-                (TaskHandle_t *)&net_task_handle);
+    if (xTaskCreate((TaskFunction_t)ui_task,
+                    (char *)"ui_task",
+                    (configSTACK_DEPTH_TYPE)UI_TASK_STACK,
+                    (void *)NULL,
+                    (UBaseType_t)UI_TASK_PRIORITY,
+                    (TaskHandle_t *)&ui_task_handle) != pdPASS)
+        created = pdFAIL;
 
-    xTaskCreate((TaskFunction_t)heartbeat_task,
-                (char *)"heartbeat_task",
-                (configSTACK_DEPTH_TYPE)HEARTBEAT_TASK_STACK,
-                (void *)NULL,
-                (UBaseType_t)HEARTBEAT_TASK_PRIORITY,
-                (TaskHandle_t *)&heartbeat_task_handle);
+    if (xTaskCreate((TaskFunction_t)net_task,
+                    (char *)"net_task",
+                    (configSTACK_DEPTH_TYPE)NET_TASK_STACK,
+                    (void *)NULL,
+                    (UBaseType_t)NET_TASK_PRIORITY,
+                    (TaskHandle_t *)&net_task_handle) != pdPASS)
+        created = pdFAIL;
+
+    if (xTaskCreate((TaskFunction_t)heartbeat_task,
+                    (char *)"heartbeat_task",
+                    (configSTACK_DEPTH_TYPE)HEARTBEAT_TASK_STACK,
+                    (void *)NULL,
+                    (UBaseType_t)HEARTBEAT_TASK_PRIORITY,
+                    (TaskHandle_t *)&heartbeat_task_handle) != pdPASS)
+        created = pdFAIL;
+
+    if (created != pdPASS)
+    {
+        /* 堆不足: 100ms 快闪报警, 且不自删, 方便调试器查看哪个句柄为 NULL */
+        while (1)
+        {
+            led_on();  vTaskDelay(pdMS_TO_TICKS(100));
+            led_off(); vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
 
     vTaskDelete(NULL);
 }

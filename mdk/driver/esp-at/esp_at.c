@@ -29,6 +29,27 @@ static uint8_t rxresult;
 /* 调试: 最后一次响应长度 */
 uint32_t esp_at_last_rxlen = 0;
 
+/* 每 1ms 等待钩子: 默认 NULL = 裸机忙等, 不依赖任何 RTOS API。
+ * RTOS 环境下由 freertos_start() 注册 vTaskDelay(1), 让出 CPU。 */
+static void (*s_wait_hook)(void) = NULL;
+
+void esp_at_set_wait_hook(void (*hook)(void))
+{
+    s_wait_hook = hook;
+}
+
+static void at_wait_1ms(void)
+{
+    if (s_wait_hook) s_wait_hook();
+    else             delay_ms(1);
+}
+
+/* 固定延时同样走让出路径, 避免 RESTORE 后的 2.5s 把低优先级任务整段饿死 */
+static void at_delay_ms(uint32_t ms)
+{
+    while (ms--) at_wait_1ms();
+}
+
 
 static void on_usart_received(uint8_t data)
 {
@@ -94,9 +115,12 @@ bool esp_at_send_command(const char *cmd, const char **rsp, uint32_t *length, ui
     esp_usart_write_string(cmd);
     esp_usart_write_string("\r\n");
 
+    /* 原来是纯 delay_ms(1) 忙等: ESP32 不应答时(最长 20s)本任务一直占着 CPU,
+     * 低优先级任务会被完全饿死。注册 wait_hook 后改为每次挂起一个 tick,
+     * 串口中断照常收数据, timeout 计数在 1kHz tick 下仍近似毫秒。 */
     while (rxready && timeout--)
     {
-        delay_ms(1);
+        at_wait_1ms();
     }
     rxready = false;
 
@@ -130,7 +154,7 @@ bool esp_at_reset(void)
      * 因此绝不能用带裁剪风险的命令来判断"模组在不在"。*/
     if (!esp_at_send_command("AT", NULL, NULL, 800))
     {
-        delay_ms(500);                              /* 可能刚好在上电启动中, 再给一次机会 */
+        at_delay_ms(500);                           /* 可能刚好在上电启动中, 再给一次机会 */
         if (!esp_at_send_command("AT", NULL, NULL, 800))
         {
             return false;                           /* 真的一字节都收不到 */
@@ -143,7 +167,7 @@ bool esp_at_reset(void)
      * 所以不执行也不影响功能。*/
     if (esp_at_send_command("AT+RESTORE", NULL, NULL, 3000))
     {
-        delay_ms(2500);                             /* RESTORE 会重启模组, 等它重新 ready */
+        at_delay_ms(2500);                          /* RESTORE 会重启模组, 等它重新 ready */
     }
 
     /* ---- 3) 关回显 / 关存储: 纯优化项, 一律不判失败 ---- */
@@ -182,7 +206,7 @@ bool esp_at_wifi_connect(const char *ssid, const char *pwd)
         {
             return true;
         }
-        delay_ms(1000);
+        at_delay_ms(1000);
     }
 
     return false;

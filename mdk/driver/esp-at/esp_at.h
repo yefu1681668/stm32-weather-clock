@@ -6,6 +6,11 @@
 #include <stdint.h>
 
 
+/* 等待让出回调(可选, 依赖倒置):
+ * 驱动层不 include 任何 RTOS 头文件。裸机/未注册时保持原来的 delay_ms(1) 忙等;
+ * 跑 RTOS 时由任务层注册一个每 1ms 让出 CPU 的实现, 避免长超时忙等饿死低优先级任务。 */
+void esp_at_set_wait_hook(void (*hook)(void));
+
 bool esp_at_init(void);
 bool esp_at_send_command(const char *cmd, const char **rsp, uint32_t *length, uint32_t timeout);
 bool esp_at_send_data(const uint8_t *data, uint32_t length);
