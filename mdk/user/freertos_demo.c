@@ -3,6 +3,8 @@
 /* FreeRTOS头文件 */
 #include "FreeRTOS.h"
 #include "task.h"
+#include "queue.h"
+#include "semphr.h"
 
 /* 驱动与应用头文件 */
 #include <string.h>
@@ -58,23 +60,82 @@ extern uint32_t esp_at_last_rxlen;
 #define H_PANEL     48
 #define W_PANEL     64
 
-/* ---------- 任务参数 ---------- */
-#define START_TASK_STACK    128
-#define START_TASK_PRIORITY 3
-#define UI_TASK_STACK       640
-#define UI_TASK_PRIORITY    1
+/* ---------- 任务参数 ----------
+ * 优先级: start(4) > ui(3) > net(2) > heartbeat(1)
+ *   ui 最高 —— 时间刷新必须准时, 不能被 HTTP 的 10s 忙等拖住;
+ *   net 次之 —— 网络慢只拖自己, 队列解耦后不会冻屏;
+ *   heartbeat 最低 —— 纯指示, 偶尔抢不到 CPU 也无妨。
+ * 三个任务栈都从已有 ucHeap(8KB) 分配, 不新增静态 RAM。 */
+#define START_TASK_STACK        128
+#define START_TASK_PRIORITY     4
+#define UI_TASK_STACK           640
+#define UI_TASK_PRIORITY        3
+#define NET_TASK_STACK          384
+#define NET_TASK_PRIORITY       2
+#define HEARTBEAT_TASK_STACK    128
+#define HEARTBEAT_TASK_PRIORITY 1
+
+/* ---------- 任务间通信 ---------- */
+typedef enum {
+    MSG_WIFI_STATUS = 0,   /* WiFi 状态变化 -> 重画状态栏 */
+    MSG_WEATHER,           /* 实况天气 + 气温 -> 重画右面板 */
+    MSG_HUMIDITY,          /* 当天湿度 -> 重画左面板 */
+    MSG_NET_DONE           /* 联网流程结束 -> 补画被进度行擦掉的日期 */
+} msg_type_t;
+
+typedef struct {
+    uint8_t  type;
+    uint8_t  wifi_ok;
+    uint8_t  humidity;
+    int16_t  temp_x10;
+    char     weather[16];
+} weather_msg_t;
 
 static TaskHandle_t start_task_handle;
 static TaskHandle_t ui_task_handle;
+static TaskHandle_t net_task_handle;
+static TaskHandle_t heartbeat_task_handle;
+
+static QueueHandle_t     g_weather_q;  /* net -> ui, 深度 4 */
+static SemaphoreHandle_t g_lcd_mutex;  /* 保护 ST7735: net 画进度 / ui 画界面 */
+static SemaphoreHandle_t g_lcd_ready;  /* 二值信号量: 屏初始化完成才放行 net */
 
 static void start_task(void *pvParameters);
 static void ui_task(void *pvParameters);
+static void net_task(void *pvParameters);
+static void heartbeat_task(void *pvParameters);
 
-/* 全局状态 */
+/* 全局状态: 只由 ui_task 读写; net_task 一律通过队列传快照, 无需加锁 */
 static uint8_t  g_wifi_ok = 0;          /* WiFi是否连接成功 */
 static int16_t  g_out_temp_x10 = 999;   /* 室外温度x10, 999=未知 */
 static char     g_out_weather[16] = "--";  /* 天气文字 */
 static uint8_t  g_humidity = 0xFF;      /* 湿度%, 0xFF=未知(接口没给) */
+
+/* 栈水位历史最小值, 供调试器观察 (heartbeat_task 每 20s 刷新) */
+static volatile UBaseType_t g_stack_min_ui  = 0xFFFF;
+static volatile UBaseType_t g_stack_min_net = 0xFFFF;
+
+/* ---------- LCD 互斥访问 ---------- */
+static void lcd_lock(void)
+{
+    xSemaphoreTake(g_lcd_mutex, portMAX_DELAY);
+}
+
+static void lcd_unlock(void)
+{
+    xSemaphoreGive(g_lcd_mutex);
+}
+
+/** 开机/联网进度行: 由 net_task 调用, 每次绘制只短暂持有 LCD 互斥量。
+ *  绝不把整段联网流程锁在里面, 否则 ui_task 会被饿死, 又变回冻屏。 */
+static void net_progress(const char *line, uint16_t color)
+{
+    lcd_lock();
+    st7735_fill_rect(0, Y_DATE, 128, H_DATE, COL_WHITE);
+    if (line != NULL)
+        st7735_write_string(2, Y_DATE, line, &font_ascii_8x16, color, COL_WHITE);
+    lcd_unlock();
+}
 
 /* ---------- 中文字体 16x16 (微软雅黑) ---------- */
 static const uint16_t cn_font[][16] = {
@@ -270,6 +331,24 @@ static void draw_image_scaled(uint16_t x, uint16_t y,
 
 void freertos_start(void)
 {
+    /* 三个同步对象必须在调度器启动前创建(此时还不能用任务间 API)。
+     * 队列深度 6: 开机时 net_task 会连发 WiFi状态/联网完成/天气/湿度 4 条,
+     * 留 2 格余量, ui_task 来得及逐条消化, 不会溢出。 */
+    g_weather_q = xQueueCreate(6, sizeof(weather_msg_t));
+    g_lcd_mutex = xSemaphoreCreateMutex();
+    g_lcd_ready = xSemaphoreCreateBinary();   /* 初值 0: UI 初始化完屏才 give */
+
+    if (g_weather_q == NULL || g_lcd_mutex == NULL || g_lcd_ready == NULL)
+    {
+        /* ucHeap 不够: 快闪报警且不启动调度器, 避免带着空句柄跑飞 */
+        led_init();
+        while (1)
+        {
+            led_on();  delay_ms(100);
+            led_off(); delay_ms(100);
+        }
+    }
+
     xTaskCreate((TaskFunction_t)start_task,
                 (char *)"start_task",
                 (configSTACK_DEPTH_TYPE)START_TASK_STACK,
@@ -287,7 +366,7 @@ static void start_task(void *pvParameters)
     /* ===== 心跳1: 进入调度器后会慢闪 3 次(300ms 亮/灭) =====
      * 完全不闪 => 程序根本没跑起来(没烧进去 / 时钟或HardFault),
      *             与屏幕、接线无关, 应先查烧录。
-     * 慢闪3次后停住 => 调度器在跑, 但下面创建 ui_task 失败(堆不足)。*/
+     * 慢闪3次后停住 => 调度器在跑, 但下面创建任务失败(堆不足)。*/
     led_init();
     for (uint8_t i = 0; i < 3; i++)
     {
@@ -303,6 +382,20 @@ static void start_task(void *pvParameters)
                 (void *)NULL,
                 (UBaseType_t)UI_TASK_PRIORITY,
                 (TaskHandle_t *)&ui_task_handle);
+
+    xTaskCreate((TaskFunction_t)net_task,
+                (char *)"net_task",
+                (configSTACK_DEPTH_TYPE)NET_TASK_STACK,
+                (void *)NULL,
+                (UBaseType_t)NET_TASK_PRIORITY,
+                (TaskHandle_t *)&net_task_handle);
+
+    xTaskCreate((TaskFunction_t)heartbeat_task,
+                (char *)"heartbeat_task",
+                (configSTACK_DEPTH_TYPE)HEARTBEAT_TASK_STACK,
+                (void *)NULL,
+                (UBaseType_t)HEARTBEAT_TASK_PRIORITY,
+                (TaskHandle_t *)&heartbeat_task_handle);
 
     vTaskDelete(NULL);
 }
@@ -337,50 +430,42 @@ static void ui_update_statusbar(void)
     draw_cn_word(96, Y_STAT, CN_GUI, CN_LIN, COL_GRAY_DK, COL_GRAY_LT);
 }
 
-/** 联网初始化 (显示详细进度) */
-static uint8_t ui_init_network(void)
+/** 联网初始化 (显示详细进度) —— 由 net_task 调用
+ *  进度绘制统一走 net_progress(): 每次只短暂持有 LCD 互斥量,
+ *  联网的几十秒里 ui_task 依然能抢占画时间。 */
+static uint8_t net_init_network(void)
 {
-    st7735_fill_rect(0, 64, 128, 16, COL_WHITE);
-    st7735_write_string(2, 64, "1/4 Init ESP...",
-                        &font_ascii_8x16, COL_GRAY_DK, COL_WHITE);
+    net_progress("1/4 Init ESP...", COL_GRAY_DK);
 
     if (!esp_at_init())
     {
         /* 提示必须够短: 8x16 字体下 128px 只能放 16 个字符,
-         * 原来 "ESP NO RESP! rx=" 已经占 15 个, 后面 4 位数字被挤出屏幕,
-         * 而那 4 位恰恰是最关键的诊断信息。*/
+         * "ESP rx=" 占 7 个, 后面 4 位数字是最关键的诊断信息。*/
         char dbg[16];
         uint8_t i = 0;
         const char *s = "ESP rx=";
         while (*s) dbg[i++] = *s++;
         u16_to_str((uint16_t)esp_at_last_rxlen, dbg + i, 4);
         dbg[i + 4] = '\0';
-        st7735_write_string(2, 64, dbg,
-                            &font_ascii_8x16, COL_TEMP_HI, COL_WHITE);
+        net_progress(dbg, COL_TEMP_HI);
         return 0;
     }
 
-    st7735_fill_rect(0, 64, 128, 16, COL_WHITE);
-    st7735_write_string(2, 64, "2/4 STA Mode...",
-                        &font_ascii_8x16, COL_GRAY_DK, COL_WHITE);
-
+    net_progress("2/4 STA Mode...", COL_GRAY_DK);
     if (!esp_at_wifi_init())
     {
-        st7735_write_string(2, 64, "STA Mode Fail!    ",
-                            &font_ascii_8x16, COL_TEMP_HI, COL_WHITE);
+        net_progress("STA Mode Fail!    ", COL_TEMP_HI);
         return 0;
     }
 
-    st7735_fill_rect(0, 64, 128, 16, COL_WHITE);
     char connmsg[40];
-    uint8_t i = 0;
-    connmsg[i++] = '3'; connmsg[i++] = '/'; connmsg[i++] = '4'; connmsg[i++] = ' ';
-    const char *s = WIFI_SSID;
-    while (*s && i < 30) connmsg[i++] = *s++;
-    connmsg[i++] = '.'; connmsg[i++] = '.'; connmsg[i++] = '.';
-    connmsg[i] = '\0';
-    st7735_write_string(2, 64, connmsg,
-                        &font_ascii_8x16, COL_GRAY_DK, COL_WHITE);
+    uint8_t k = 0;
+    connmsg[k++] = '3'; connmsg[k++] = '/'; connmsg[k++] = '4'; connmsg[k++] = ' ';
+    const char *ss = WIFI_SSID;
+    while (*ss && k < 30) connmsg[k++] = *ss++;
+    connmsg[k++] = '.'; connmsg[k++] = '.'; connmsg[k++] = '.';
+    connmsg[k] = '\0';
+    net_progress(connmsg, COL_GRAY_DK);
 
     if (!esp_at_wifi_connect(WIFI_SSID, WIFI_PWD))
     {
@@ -390,33 +475,24 @@ static uint8_t ui_init_network(void)
         while (*s) dbg[i++] = *s++;
         u16_to_str((uint16_t)esp_at_last_rxlen, dbg + i, 4);
         dbg[i + 4] = '\0';
-        st7735_write_string(2, 64, dbg,
-                            &font_ascii_8x16, COL_TEMP_HI, COL_WHITE);
+        net_progress(dbg, COL_TEMP_HI);
         return 0;
     }
 
-    st7735_fill_rect(0, 64, 128, 16, COL_WHITE);
-    st7735_write_string(2, 64, "4/4 SNTP Sync...",
-                        &font_ascii_8x16, COL_GRAY_DK, COL_WHITE);
-
+    net_progress("4/4 SNTP Sync...", COL_GRAY_DK);
     if (!esp_at_sntp_init())
     {
-        st7735_write_string(2, 64, "SNTP Fail(cont)   ",
-                            &font_ascii_8x16, 0xFD20, COL_WHITE);
+        net_progress("SNTP Fail(cont)   ", 0xFD20);
     }
     else
     {
-        /* 用 CIPSNTPTIME 的字符串解析时间。
-         * 原来走 AT+SYSTIMESTAMP? + rtc_set_timestamp(ts + 8h),
-         * 但精简版 AT 固件不支持 SYSTIMESTAMP, 解析出 ts=0,
-         * RTC 被写成 1970-01-01 08:00, 屏幕就显示 08:xx 这种假时间。
-         * CIPSNTPTIME 返回的已经是本地时间, 绝对不能再 +8 小时。*/
+        /* CIPSNTPTIME 返回的已经是本地时间, 绝对不能再 +8 小时,
+         * 否则解析失败会写成 1970-01-01 的假时间。*/
         sync_time_from_esp();
     }
 
-    g_wifi_ok = 1;
-    st7735_fill_rect(0, 64, 128, 16, COL_WHITE);
-    return 1;
+    net_progress(NULL, COL_WHITE);   /* 擦掉进度行 */
+    return 1;                       /* WiFi 状态由 net_task 发队列消息给 UI */
 }
 
 /** 更新日期 + 星期 */
@@ -461,29 +537,40 @@ static void ui_update_time(uint8_t blink)
     st7735_write_string(4, Y_TIME, str, &font_time_24x48, COL_TIME_BLK, COL_WHITE);
 }
 
-/** 更新室外天气 (右侧橙色面板) */
-static void ui_update_weather(void)
+/** 取实况天气: 只做 HTTP + 解析, 不碰屏幕 (由 net_task 调用)。
+ *  esp_at_get_http() 最长阻塞 10s, 但它跑在低优先级任务里,
+ *  ui_task 依然能抢占刷新时间 —— 这正是拆任务要解决的冻屏问题。 */
+static uint8_t net_fetch_weather(weather_msg_t *msg)
 {
     const char *rsp = NULL;
-    if (esp_at_get_http(WEATHER_URI, &rsp, NULL, 10000))
-    {
-        weather_t weather;
-        if (weather_parse(rsp, &weather))
-        {
-            /* 解析温度 */
-            int16_t t = 0;
-            uint8_t i = 0;
-            while (weather.temperature[i] >= '0' && weather.temperature[i] <= '9' && i < 3)
-            {
-                t = t * 10 + (weather.temperature[i] - '0');
-                i++;
-            }
-            g_out_temp_x10 = t * 10;
-            strncpy(g_out_weather, weather.weather, 15);
-            g_out_weather[15] = '\0';
-        }
-    }
+    msg->type = MSG_WEATHER;
+    msg->temp_x10 = 999;
+    strncpy(msg->weather, "--", 15);
+    msg->weather[15] = '\0';
 
+    if (!esp_at_get_http(WEATHER_URI, &rsp, NULL, 10000))
+        return 0;
+
+    weather_t weather;
+    if (!weather_parse(rsp, &weather))
+        return 0;
+
+    int16_t t = 0;
+    uint8_t i = 0;
+    while (weather.temperature[i] >= '0' && weather.temperature[i] <= '9' && i < 3)
+    {
+        t = t * 10 + (weather.temperature[i] - '0');
+        i++;
+    }
+    msg->temp_x10 = t * 10;
+    strncpy(msg->weather, weather.weather, 15);
+    msg->weather[15] = '\0';
+    return 1;
+}
+
+/** 刷新右侧橙色面板: 只画屏, 数据来自 ui_task 的缓存 (只由 ui_task 调用) */
+static void ui_update_weather(void)
+{
     /* 擦除右面板 */
     st7735_fill_rect(W_PANEL, Y_PANEL, W_PANEL, H_PANEL, COL_OUTDOOR_BG);
 
@@ -575,7 +662,7 @@ static void ui_update_indoor(void)
                         &font_ascii_8x16, COL_TEXT_W, COL_INDOOR_BG);
 }
 
-/** 单独取一次湿度 (心知 daily.json) 并刷新左面板
+/** 单独取一次湿度 (心知 daily.json), 结果经队列交给 ui_task 刷新左面板
  *
  *  为什么要单独请求: 实况接口 now.json 只返回 text/code/temperature,
  *  没有湿度字段; 湿度在 3 天预报接口里。
@@ -585,89 +672,191 @@ static void ui_update_indoor(void)
  *  合计 168 次, 留足余量。
  *
  *  取不到就保持上一次的值(或 --%), 不会把界面刷成空白。 */
-static void ui_update_humidity(void)
+static uint8_t net_fetch_humidity(uint8_t *humi)
 {
     const char *rsp = NULL;
-    if (esp_at_get_http(WEATHER_HUMI_URI, &rsp, NULL, 10000))
+    uint8_t h = 0;
+    if (!esp_at_get_http(WEATHER_HUMI_URI, &rsp, NULL, 10000))
+        return 0;
+    if (!weather_parse_humidity(rsp, &h))
+        return 0;
+    *humi = h;
+    return 1;
+}
+
+/* ---------- 三个任务的实现 ---------- */
+
+/** 网络任务 (优先级 2): 联网、对时、周期取天气/湿度。
+ *  所有耗时操作都关在这里, 结果通过队列发给 ui_task。
+ *  即使某次 HTTP 卡满 10s, ui_task 与 heartbeat_task 照常运行。 */
+static void net_task(void *pvParameters)
+{
+    (void)pvParameters;
+    weather_msg_t msg;
+    uint8_t humi = 0;
+
+    /* 等 ui_task 完成 st7735_init()/rtc_init() 后再碰屏幕,
+     * 否则 net_progress() 会往一个还没初始化的 LCD 写数据。 */
+    xSemaphoreTake(g_lcd_ready, portMAX_DELAY);
+
+    uint8_t wifi_ok = net_init_network();
+
+    memset(&msg, 0, sizeof(msg));
+    msg.type = MSG_WIFI_STATUS;
+    msg.wifi_ok = wifi_ok;
+    xQueueSend(g_weather_q, &msg, 0);
+
+    /* 进度行画在日期区, 结束时擦掉了日期, 通知 UI 补画一次 */
+    msg.type = MSG_NET_DONE;
+    xQueueSend(g_weather_q, &msg, 0);
+
+    if (wifi_ok)
     {
-        uint8_t h = 0;
-        if (weather_parse_humidity(rsp, &h))
+        if (net_fetch_weather(&msg))    /* 失败就不发, UI 保持上一次的值 */
+            xQueueSend(g_weather_q, &msg, 0);
+
+        if (net_fetch_humidity(&humi))
         {
-            g_humidity = h;
-            ui_update_indoor();
+            memset(&msg, 0, sizeof(msg));
+            msg.type = MSG_HUMIDITY;
+            msg.humidity = humi;
+            xQueueSend(g_weather_q, &msg, 0);
+        }
+    }
+
+    /* 1s 节拍: 10min 刷天气+对时, 60min 刷湿度(按免费额度控制频率) */
+    uint32_t sec = 0;
+    while (1)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (!wifi_ok) continue;
+        sec++;
+
+        if (sec % 600 == 0)             /* 每 10 min */
+        {
+            if (net_fetch_weather(&msg))
+                xQueueSend(g_weather_q, &msg, 0);
+            sync_time_from_esp();       /* SNTP 重新对时 */
+            msg.type = MSG_NET_DONE;    /* 跨日时日期要跟着更新 */
+            xQueueSend(g_weather_q, &msg, 0);
+        }
+
+        if (sec % 3600 == 0)            /* 每 60 min */
+        {
+            if (net_fetch_humidity(&humi))
+            {
+                memset(&msg, 0, sizeof(msg));
+                msg.type = MSG_HUMIDITY;
+                msg.humidity = humi;
+                xQueueSend(g_weather_q, &msg, 0);
+            }
         }
     }
 }
 
-/* ---------- UI主任务 ---------- */
-
+/** 显示任务 (优先级 3): 只画屏, 不发起任何网络请求。
+ *  队列用非阻塞接收(超时 0), 消化完积压消息才进 500ms 延时,
+ *  所以时间/冒号刷新完全不受网络快慢影响。 */
 static void ui_task(void *pvParameters)
 {
     (void)pvParameters;
+    weather_msg_t msg;
+    uint32_t tick = 0;
+    uint8_t blink = 1;
 
-    led_init();
-    led_on();
-
+    /* 屏、RTC、传感器只在 UI 任务里初始化一次 */
+    lcd_lock();
     st7735_init();
-    rtc_init();          /* RTC: LSE 起振失败会自动降级 LSI, 不会卡死 */
-    mpu6050_init();      /* 室内温度来源 */
-
-    /* 先把静态框架画出来, 让屏幕立刻有内容 */
+    rtc_init();          /* LSE 起振失败会自动降级 LSI, 不会卡死 */
+    mpu6050_init();
     ui_draw_frame();
     ui_update_statusbar();
     ui_update_date();
     ui_update_time(1);
     ui_update_indoor();
+    lcd_unlock();
 
-    /* 注意顺序: 这里绝对不能先调 ui_update_weather()。
-     * ESP32 的串口是在下面 ui_init_network() -> esp_at_init() -> esp_usart_init()
-     * 里才初始化的; 提前取天气等于把 AT 命令发给一个还没打开的串口,
-     * 然后白等 esp_at_get_http() 里 10 秒的硬超时,
-     * 屏幕就会长时间停在"橙色面板一片空白"的样子。*/
+    /* 放行网络任务: 从这一刻起 net_task 才能调用 net_progress() */
+    xSemaphoreGive(g_lcd_ready);
 
-    /* 联网 (失败也继续) */
-    ui_init_network();
-
-    /* ui_init_network() 全程在 y=64..80 这一行显示 "1/4..4/4" 进度,
-     * 结束时把这段刷成白色, 正好把日期行一起擦掉了。
-     * 所以这里必须把日期补画回来, 否则联网完成后日期会消失。*/
-    ui_update_date();
-
-    /* 联网后刷新状态栏和天气 (天气里带着湿度, 右边刷完紧接着刷左边) */
-    ui_update_statusbar();
-    if (g_wifi_ok) ui_update_weather();
-    ui_update_indoor();                 /* 先按旧值/占位画一次左面板 */
-    if (g_wifi_ok) ui_update_humidity();/* 再单独取一次湿度并刷新左面板 */
-
-    uint32_t tick = 0;
-    uint8_t blink = 1;
     while (1)
     {
+        /* 先把队列里积压的消息全部消化掉 */
+        while (xQueueReceive(g_weather_q, &msg, 0) == pdTRUE)
+        {
+            lcd_lock();
+            switch (msg.type)
+            {
+            case MSG_WIFI_STATUS:
+                g_wifi_ok = msg.wifi_ok;
+                ui_update_statusbar();
+                break;
+
+            case MSG_WEATHER:
+                g_out_temp_x10 = msg.temp_x10;
+                strncpy(g_out_weather, msg.weather, 15);
+                g_out_weather[15] = '\0';
+                ui_update_weather();
+                break;
+
+            case MSG_HUMIDITY:
+                g_humidity = msg.humidity;
+                ui_update_indoor();
+                break;
+
+            case MSG_NET_DONE:
+                ui_update_date();       /* 进度行擦掉日期后补画 */
+                break;
+
+            default:
+                break;
+            }
+            lcd_unlock();
+        }
+
         vTaskDelay(pdMS_TO_TICKS(500));
         tick++;
         blink = !blink;
 
+        lcd_lock();
         ui_update_time(blink);
+        if (tick % 120 == 0) ui_update_date();   /* 每 60 s 校准日期显示 */
+        lcd_unlock();
+    }
+}
 
-        if (tick % 4 == 0)              /* 每2s: 室内 */
-            ui_update_indoor();
+/** 心跳任务 (优先级 1): LED 1Hz 慢闪 + 每 20s 采样各任务栈水位。
+ *  用 uxTaskGetStackHighWaterMark() 记录历史最小剩余栈, 供调试器观察;
+ *  低于 64 words(256B) 时快闪 3 次告警, 把栈隐患暴露在烧录阶段。 */
+static void heartbeat_task(void *pvParameters)
+{
+    (void)pvParameters;
+    led_init();
+    uint32_t beat = 0;
 
-        if (tick % 120 == 0)            /* 每60s: 日期 */
-            ui_update_date();
+    while (1)
+    {
+        led_on();
+        vTaskDelay(pdMS_TO_TICKS(500));
+        led_off();
+        vTaskDelay(pdMS_TO_TICKS(500));
+        beat++;
 
-        if (tick % 1200 == 0)           /* 每10min: 天气+对时 */
+        if (beat % 20 == 0)             /* 每 20 s */
         {
-            ui_update_weather();
-            sync_time_from_esp();
-            ui_update_date();           /* 跨日时日期要跟着更新 */
-        }
+            UBaseType_t hw_ui  = uxTaskGetStackHighWaterMark(ui_task_handle);
+            UBaseType_t hw_net = uxTaskGetStackHighWaterMark(net_task_handle);
+            if (hw_ui  < g_stack_min_ui)  g_stack_min_ui  = hw_ui;
+            if (hw_net < g_stack_min_net) g_stack_min_net = hw_net;
 
-        if (tick % 7200 == 0)           /* 每60min: 湿度(单独接口, 省额度) */
-        {
-            ui_update_humidity();
+            if (hw_ui < 64 || hw_net < 64)
+            {
+                for (uint8_t i = 0; i < 3; i++)
+                {
+                    led_on();  vTaskDelay(pdMS_TO_TICKS(80));
+                    led_off(); vTaskDelay(pdMS_TO_TICKS(80));
+                }
+            }
         }
-
-        if (blink) led_on();
-        else       led_off();
     }
 }
