@@ -126,9 +126,13 @@ void ts_to_date(uint32_t seconds, rtc_date_t *date)
     date->day = seconds;
 }
 
+/* RTOFF 是 RTC 寄存器写完成标志。若 RTC 没有任何时钟源(既无LSE也无LSI),
+ * 它永远不会置位, 原代码的裸 while 会永久卡死。加超时兜底。*/
 static void rtc_wait_for_rtoff(void)
 {
-    while ((RTC->CRL & RTC_CRL_RTOFF) == 0)
+    uint32_t timeout = 0x400000UL;   /* 72MHz 下约 0.5 秒 */
+
+    while (((RTC->CRL & RTC_CRL_RTOFF) == 0) && (--timeout != 0))
         ;
 }
 
@@ -144,33 +148,68 @@ static void rtc_exit_config(void)
     rtc_wait_for_rtoff();
 }
 
+/* LSE 起振等待超时计数 (72MHz 下约 2.3 秒)
+ * 原代码为无超时死等: 若板上未焊 32.768kHz 晶振或晶振不起振,
+ * 程序会永久停在这里, 表现为屏幕停在 st7735_fill_screen 刷出的白屏。
+ * LSE 正常起振只需几十~几百 ms, 只有异常时才会等满这个时限。*/
+#define RTC_LSE_TIMEOUT   0x1000000UL
+
 void rtc_init(void)
 {
+    uint32_t timeout;
+    uint8_t  use_lsi = 0;
+
     /* 使能PWR和BKP时钟, 开启后备区写访问 */
     __HAL_RCC_PWR_CLK_ENABLE();
     __HAL_RCC_BKP_CLK_ENABLE();
     PWR->CR |= PWR_CR_DBP;
 
-    /* 使能LSE外部低速晶振并等待就绪 */
+    /* RTCSEL 一旦写入即被锁定, 只有复位备份域才能改;
+     * 先把可能残留的旧配置清掉, 否则下面写 RTCSEL 无效。*/
+    RCC->BDCR |= RCC_BDCR_BDRST;
+    RCC->BDCR &= ~RCC_BDCR_BDRST;
+
+    /* 使能LSE外部低速晶振, 带超时等待就绪 */
     RCC->BDCR |= RCC_BDCR_LSEON;
-    while ((RCC->BDCR & RCC_BDCR_LSERDY) == 0)
+    timeout = RTC_LSE_TIMEOUT;
+    while (((RCC->BDCR & RCC_BDCR_LSERDY) == 0) && (--timeout != 0))
         ;
 
-    /* 选择RTC时钟源为LSE */
-    RCC->BDCR &= ~(RCC_BDCR_RTCSEL);
-    RCC->BDCR |= RCC_BDCR_RTCSEL_0;  /* RTCSEL = 01 = LSE */
+    if (timeout == 0)
+    {
+        /* LSE 起振失败: 降级用内部 LSI(约40kHz), 保证程序继续运行。
+         * 代价是走时精度差(LSI 偏差可达 ±50%), 仅作界面可用的兜底。
+         *
+         * 注意: 先把 LSI 振荡器打开并等稳定, 再切 RTCSEL。
+         * 顺序反了(直接选LSI但LSION没开)会让 RTC 完全没有时钟源,
+         * RTOFF 永不置位 -> 卡在 rtc_enter_config, 依旧白屏。*/
+        RCC->CSR |= RCC_CSR_LSION;
+        timeout = RTC_LSE_TIMEOUT;
+        while (((RCC->CSR & RCC_CSR_LSIRDY) == 0) && (--timeout != 0))
+            ;
+
+        RCC->BDCR &= ~(RCC_BDCR_RTCSEL);
+        RCC->BDCR |= RCC_BDCR_RTCSEL_1;   /* RTCSEL = 10 = LSI */
+        use_lsi = 1;
+    }
+    else
+    {
+        RCC->BDCR &= ~(RCC_BDCR_RTCSEL);
+        RCC->BDCR |= RCC_BDCR_RTCSEL_0;   /* RTCSEL = 01 = LSE */
+    }
 
     /* 使能RTC */
     RCC->BDCR |= RCC_BDCR_RTCEN;
 
-    /* 等待寄存器同步 */
+    /* 等待寄存器同步 (同样加超时, 避免二次死等) */
     RTC->CRL &= ~RTC_CRL_RSF;
-    while ((RTC->CRL & RTC_CRL_RSF) == 0)
+    timeout = RTC_LSE_TIMEOUT;
+    while (((RTC->CRL & RTC_CRL_RSF) == 0) && (--timeout != 0))
         ;
 
-    /* 设置预分频器: LSE=32768Hz, 分频32768 -> 1Hz; 计数寄存器值-1 */
+    /* 设置预分频器: LSE=32768Hz -> 32767; LSI≈40kHz -> 39999 */
     rtc_enter_config();
-    RTC->PRLL = 32767;
+    RTC->PRLL = use_lsi ? 39999U : 32767U;
     rtc_exit_config();
 }
 

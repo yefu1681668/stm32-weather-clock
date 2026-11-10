@@ -79,5 +79,9 @@ void st7735_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t c
 void st7735_fill_screen(uint16_t color);
 void st7735_draw_image(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint8_t *data);
 
+/* 调试探针: 顶部画 红|绿|蓝|白 四色彩条(阻塞写, 不走DMA)。
+ * 用来判断"数据到底有没有送到屏上", 排查完可删。*/
+void st7735_probe_bars(void);
+
 
 #endif // __ST7735_H__

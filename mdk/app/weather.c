@@ -52,3 +52,32 @@ bool weather_parse(const char *data, weather_t *weather)
 
     return true;
 }
+
+
+// 从 daily.json 里取今天(第一条)的湿度
+// 示例: ...,"high":"18","low":"9","rainfall":"0.00","precip":"0.00",
+//       "wind_direction":"NE",...,"humidity":"50"}],...
+bool weather_parse_humidity(const char *data, uint8_t *out)
+{
+    const char *p = strstr(data, "\"humidity\":\"");
+    if (p == NULL)
+    {
+        return false;
+    }
+    p += strlen("\"humidity\":\"");
+
+    uint16_t v = 0;
+    uint8_t n = 0;
+    while (*p >= '0' && *p <= '9' && n < 3)
+    {
+        v = v * 10 + (uint8_t)(*p - '0');
+        p++;
+        n++;
+    }
+    if (n == 0 || v > 100)
+    {
+        return false;
+    }
+    *out = (uint8_t)v;
+    return true;
+}

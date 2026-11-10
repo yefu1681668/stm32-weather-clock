@@ -69,15 +69,26 @@ void lcd_spi_init(void)
     lcd_spi_lowlevel_init();
 }
 
+/* 阻塞写: 逐字节轮询 TXE 写入。
+ * 超时计数要"小": 正常情况第一轮就能置位, 根本不需要等;
+ * 一旦 SPI 异常, 超时值过大会让每字节白等几十毫秒,
+ * 32KB 一屏就算成 10 分钟, 表现就像死机。这里压到约 0.1ms。*/
 void lcd_spi_write(uint8_t *data, uint16_t length)
 {
+    uint32_t guard;
+
     for (uint16_t i = 0; i < length; i++)
     {
-        while ((SPI1->SR & SPI_SR_TXE) == 0)
+        guard = 2000UL;
+        while (((SPI1->SR & SPI_SR_TXE) == 0) && (--guard != 0))
             ;
+        if (guard == 0)
+            return;                     /* SPI 异常, 宁可丢数据也不死等 */
         *(volatile uint8_t *)&SPI1->DR = data[i];
     }
-    while (SPI1->SR & SPI_SR_BSY)
+
+    guard = 2000UL;
+    while (((SPI1->SR & SPI_SR_BSY) != 0) && (--guard != 0))
         ;
 }
 

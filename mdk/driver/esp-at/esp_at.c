@@ -123,20 +123,34 @@ bool esp_at_send_data(const uint8_t *data, uint32_t length)
 
 bool esp_at_reset(void)
 {
-    // 复位esp32 (RESTORE会重启模块, 需等待)
-    if (!esp_at_send_command("AT+RESTORE", NULL, NULL, 3000))
+    /* ---- 1) 先用最基础的 "AT" 探测模组是否在线 ----
+     * 所有 AT 固件都支持 AT 命令, 这是唯一可靠的存在性判据。
+     * 实测本模组的固件为【精简版】: 不支持 AT+GMR / AT+VER / AT+?
+     * / AT+CIPSTA, 但支持 AT / AT+CWMODE / AT+CWJAP / AT+RST,
+     * 因此绝不能用带裁剪风险的命令来判断"模组在不在"。*/
+    if (!esp_at_send_command("AT", NULL, NULL, 800))
     {
-        return false;
+        delay_ms(500);                              /* 可能刚好在上电启动中, 再给一次机会 */
+        if (!esp_at_send_command("AT", NULL, NULL, 800))
+        {
+            return false;                           /* 真的一字节都收不到 */
+        }
     }
-    delay_ms(3000);
-    // 关闭回显
-    if (!esp_at_send_command("ATE0", NULL, NULL, 1000))
+
+    /* ---- 2) 恢复出厂: 尽力而为, 失败也继续 ----
+     * 精简固件收到 AT+RESTORE 可能直接回 ERROR。它只是"清配置",
+     * 而 WiFi 账号密码由 wifi_config.h 每次启动重新 CWJAP 建立,
+     * 所以不执行也不影响功能。*/
+    if (esp_at_send_command("AT+RESTORE", NULL, NULL, 3000))
     {
-        return false;
+        delay_ms(2500);                             /* RESTORE 会重启模组, 等它重新 ready */
     }
-    // 关闭存储 (ESP8266不支持此命令, 失败也继续)
+
+    /* ---- 3) 关回显 / 关存储: 纯优化项, 一律不判失败 ---- */
+    esp_at_send_command("ATE0", NULL, NULL, 1000);
     esp_at_send_command("AT+SYSSTORE=0", NULL, NULL, 1000);
 
+    /* 真正的连通性已经由第 1 步的 AT 验证过了 */
     return true;
 }
 

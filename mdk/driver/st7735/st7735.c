@@ -19,6 +19,13 @@
 
 #define GRAM_BUFFER_SIZE 4096
 
+/* 像素数据的发送方式:
+ *   1 = DMA (快, 但依赖 DMA 通道配置正确)
+ *   0 = 纯阻塞轮询 TXE (慢一点, 完全不碰 DMA, 最稳)
+ * 白屏排查期间先用 0: 如果阻塞能刷出画面, 说明 SPI 引脚/接线/屏都正常,
+ * 白屏就是 DMA 那条路的问题; 确认链路 OK 后再改回 1 恢复速度。*/
+#define ST7735_USE_DMA   0
+
 // ST7735 Commands
 #define ST7735_NOP     0x00
 #define ST7735_SWRESET 0x01
@@ -143,11 +150,41 @@ static void st7735_write_cmd(uint8_t cmd)
 static void st7735_write_data(uint8_t *data, size_t size)
 {
     HAL_GPIO_WritePin(DC_PORT, DC_PIN, GPIO_PIN_SET);
+
+#if ST7735_USE_DMA
+    uint32_t guard;
+
     lcd_spi_write_async(data, size);
-    /* 轮询DMA完成标志, 不依赖中断 (FreeRTOS下中断等待不可靠) */
-    while ((DMA1->ISR & DMA_ISR_TCIF3) == 0);
+    /* 轮询DMA完成标志, 不依赖中断 (FreeRTOS下中断等待不可靠)
+     * 原代码为裸 while, DMA 一旦不启动就会永久卡死; 这里加超时兜底,
+     * 便于定位"到底是DMA没跑, 还是屏没显示"。*/
+    guard = 400000UL;
+    while (((DMA1->ISR & DMA_ISR_TCIF3) == 0) && (--guard != 0))
+        ;
     DMA1->IFCR = DMA_IFCR_CTCIF3;
-    while ((SPI1->SR & SPI_SR_BSY) != 0);
+
+    guard = 400000UL;
+    while (((SPI1->SR & SPI_SR_BSY) != 0) && (--guard != 0))
+        ;
+#else
+    /* 阻塞写: 不经过 DMA, 直接往 DR 里塞字节。
+     * 这条路能通就证明 SCK/MOSI/CS/DC 全对、屏能正常接收;
+     * 走这条路还是白屏, 那就与软件无关, 一定是接线或屏本身。
+     * 超时值要小: 异常时若每字节白等几十毫秒, 刷一屏会像死机一样停十几分钟。*/
+    for (size_t i = 0; i < size; i++)
+    {
+        uint32_t guard = 2000UL;
+        while (((SPI1->SR & SPI_SR_TXE) == 0) && (--guard != 0))
+            ;
+        if (guard == 0)
+            return;                     /* SPI 异常, 不死等 */
+        *(volatile uint8_t *)&SPI1->DR = data[i];
+    }
+
+    uint32_t guard = 2000UL;
+    while (((SPI1->SR & SPI_SR_BSY) != 0) && (--guard != 0))
+        ;
+#endif
 }
 
 static void st7735_exec_cmds(const uint8_t *cmd_list)
@@ -235,6 +272,66 @@ void st7735_init(void)
     st7735_unselect();
 
     st7735_bl_on();
+}
+
+/* ------------------------------------------------------------------
+ * 调试探针: 彩条
+ * 在屏幕顶部画 4 个 32x32 实心块: 红 绿 蓝 白。
+ * 这一段刻意不走 st7735_write_data / DMA / 窗口函数, 全部自己用阻塞写拼出来,
+ * 目的只有一个: 用最少的代码路径判断"数据到底有没有送到屏上"。
+ *   出现 红绿蓝白 彩条 -> SPI 链路正常, 白屏是上层绘图/DMA 的问题;
+ *   仍然一片白         -> 数据没到屏, 属于接线/引脚/屏型号问题, 不要再改绘图代码。
+ * 问题定位完可以删掉本函数及其调用。
+ * ------------------------------------------------------------------*/
+void st7735_probe_bars(void)
+{
+    static const uint16_t bars[4] = {0xF800, 0x07E0, 0x001F, 0xFFFF};  /* 红 绿 蓝 白 */
+    uint8_t buf[64];
+    uint8_t d[4];
+
+    for (uint8_t b = 0; b < 4; b++)
+    {
+        /* 16x16 而不是 32x32: 数据量只有 1/4, 即使 SPI 异常也能在
+         * 几十毫秒内走完, 不会让整机看起来"卡死"。*/
+        uint16_t x = b * 16;
+        uint16_t w = 16, h = 16;
+        uint32_t total;
+
+        for (uint32_t i = 0; i < sizeof(buf); i += 2)
+        {
+            buf[i]     = (uint8_t)(bars[b] >> 8);
+            buf[i + 1] = (uint8_t)(bars[b] & 0xFF);
+        }
+
+        st7735_select();
+
+        /* 列地址 */
+        st7735_write_cmd(ST7735_CASET);
+        d[0] = 0x00; d[1] = (uint8_t)(x + ST7735_XSTART);
+        d[2] = 0x00; d[3] = (uint8_t)(x + w - 1 + ST7735_XSTART);
+        HAL_GPIO_WritePin(DC_PORT, DC_PIN, GPIO_PIN_SET);
+        lcd_spi_write(d, 4);
+
+        /* 行地址 */
+        st7735_write_cmd(ST7735_RASET);
+        d[1] = (uint8_t)(0 + ST7735_YSTART);
+        d[3] = (uint8_t)(h - 1 + ST7735_YSTART);
+        HAL_GPIO_WritePin(DC_PORT, DC_PIN, GPIO_PIN_SET);
+        lcd_spi_write(d, 4);
+
+        /* 写显存 */
+        st7735_write_cmd(ST7735_RAMWR);
+        HAL_GPIO_WritePin(DC_PORT, DC_PIN, GPIO_PIN_SET);
+
+        for (total = (uint32_t)w * h * 2; total > 0; )
+        {
+            uint16_t chunk = (total > sizeof(buf)) ? (uint16_t)sizeof(buf) : (uint16_t)total;
+            lcd_spi_write(buf, chunk);
+            total -= chunk;
+        }
+
+        st7735_unselect();
+    }
 }
 
 void st7735_draw_pixel(uint16_t x, uint16_t y, uint16_t color)
