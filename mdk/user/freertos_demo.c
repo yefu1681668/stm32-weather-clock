@@ -19,6 +19,7 @@
 #include "wifi_config.h"     /* WiFi 账号 / 天气 API key（本地私有，勿提交真实值） */
 #include "w25q.h"            /* 外部 SPI Flash: 天气图标外置用 */
 #include "icons_flash.h"     /* 图标在 W25Q 里的固定偏移 */
+#include "app_upgrade.h"     /* OTA 第②步: 串口 'U' → 请求升级 → 复位回 Boot */
 
 /* 调试: ESP32最后响应长度 */
 extern uint32_t esp_at_last_rxlen;
@@ -366,6 +367,11 @@ static void net_wait_1ms(void)
 
 void freertos_start(void)
 {
+    /* OTA 第②步：打开 USART1 接收中断，让 APP 运行时也能收到 'U' 升级命令。
+     * 必须在调度器启动前做（此时 NVIC 还没被 RTOS 接管），
+     * ISR 只置一个 volatile 标志，不会调用任何 FreeRTOS API。 */
+    app_upgrade_init();
+
     /* 三个同步对象必须在调度器启动前创建(此时还不能用任务间 API)。
      * 队列深度 6: 开机时 net_task 会连发 WiFi状态/联网完成/天气/湿度 4 条,
      * 留 2 格余量, ui_task 来得及逐条消化, 不会溢出。 */
@@ -911,10 +917,17 @@ static void heartbeat_task(void *pvParameters)
 
     while (1)
     {
-        led_on();
-        vTaskDelay(pdMS_TO_TICKS(500));
-        led_off();
-        vTaskDelay(pdMS_TO_TICKS(500));
+        /* 20 × 50 ms = 1 s，前 10 拍亮、后 10 拍灭，LED 仍是原来那个 1 Hz。
+         * 拆细是为了每 50 ms 顺手查一次升级请求：原来一秒才醒一次，
+         * 串口发个 'U' 最多要等 1 秒才有反应。 */
+        for (uint16_t tick = 0; tick < 20; tick++)
+        {
+            if (tick == 0)  led_on();
+            if (tick == 10) led_off();
+
+            app_upgrade_poll();
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
         beat++;
 
         if (beat % 20 == 0)             /* 每 20 s */

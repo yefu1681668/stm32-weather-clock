@@ -336,7 +336,7 @@
               <MiscControls></MiscControls>
               <Define>USE_HAL_DRIVER,STM32F103xE</Define>
               <Undefine></Undefine>
-              <IncludePath>..\Core\Inc;..\Drivers\STM32F1xx_HAL_Driver\Inc;..\Drivers\STM32F1xx_HAL_Driver\Inc\Legacy;..\Drivers\CMSIS\Device\ST\STM32F1xx\Include;..\Drivers\CMSIS\Include;..\FreeRTOS\include;..\FreeRTOS\portable\RVDS\ARM_CM3;.\app;.\driver;.\driver\st7735;.\driver\esp-at;.\driver\mpu6050;.\driver\w25q;.\user</IncludePath>
+              <IncludePath>..\Core\Inc;..\Drivers\STM32F1xx_HAL_Driver\Inc;..\Drivers\STM32F1xx_HAL_Driver\Inc\Legacy;..\Drivers\CMSIS\Device\ST\STM32F1xx\Include;..\Drivers\CMSIS\Include;..\FreeRTOS\include;..\FreeRTOS\portable\RVDS\ARM_CM3;.\app;.\driver;.\driver\st7735;.\driver\esp-at;.\driver\mpu6050;.\driver\w25q;.\user;..\boot</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -378,6 +378,26 @@
       </TargetOption>
       <Groups>
         <Group>
+          <GroupName>Boot/Shared</GroupName>
+          <Files>
+            <File>
+              <FileName>boot_param.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\boot\boot_param.c</FilePath>
+            </File>
+            <File>
+              <FileName>boot_crc.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\boot\boot_crc.c</FilePath>
+            </File>
+            <File>
+              <FileName>boot_flash.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\boot\boot_flash.c</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
           <GroupName>Application/User</GroupName>
           <Files>
             <File>
@@ -409,6 +429,11 @@
               <FileName>freertos_demo.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\user\freertos_demo.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_upgrade.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\app_upgrade.c</FilePath>
             </File>
           </Files>
         </Group>

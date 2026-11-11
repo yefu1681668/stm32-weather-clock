@@ -35,10 +35,12 @@ void MX_USART1_UART_Init(void)
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    /* PA10 RX - Input */
+    /* PA10 RX - Input
+     * 必须上拉：CH340 没接时 RX 若浮空，线路噪声会被当成起始位，
+     * 触发假的 RXNE 中断甚至误判成升级命令。Boot 侧同样配了上拉。 */
     GPIO_InitStruct.Pin = GPIO_PIN_10;
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
     /* 115200 @ 72MHz: BRR = 72000000 / 115200 = 625 = 0x271 */

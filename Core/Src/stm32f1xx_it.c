@@ -24,6 +24,7 @@
 /* USER CODE BEGIN Includes */
 #include "FreeRTOS.h"
 #include "task.h"
+#include "app_upgrade.h"        /* OTA 第②步：串口升级命令 */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -211,9 +212,8 @@ void SysTick_Handler(void)
 void USART1_IRQHandler(void)
 {
     /* USER CODE BEGIN USART1_IRQn 0 */
-
+    app_upgrade_rx_isr();       /* OTA 第②步：收 'U' → 置升级请求标志 */
     /* USER CODE END USART1_IRQn 0 */
-    /* 调试串口未使用中断, 直接返回 */
     /* USER CODE BEGIN USART1_IRQn 1 */
 
     /* USER CODE END USART1_IRQn 1 */

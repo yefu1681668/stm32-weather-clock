@@ -167,23 +167,61 @@ net_task:  xSemaphoreTake(g_lcd_ready)         屏没初始化好之前绝不碰
 
 | 区域 | 起始地址 | 大小 | 当前占用 |
 |---|---|---|---|
-| Boot | `0x08000000` | 16 KB | 4 180 B（25.5%） |
-| APP | `0x08004000` | 47 KB（`0xBC00`） | 21 128 B（43.9%） |
+| Boot | `0x08000000` | 16 KB | 5 360 B（32.7%） |
+| APP | `0x08004000` | 47 KB（`0xBC00`） | 22 564 B（46.9%） |
 | 参数页 | `0x0800FC00` | 1 KB | 升级标志 / `boot_try` 计数 |
 
-Boot 主流程：`HAL_Init` → 时钟（HSE 起不来就 10 Hz 快闪报错，不装死）→ 读参数页 → 校验 APP 起始处的 MSP/PC 是否落在 `0x08004000`~`0x20005000` 内 → **3 秒窗口**（LED 5 Hz 快闪 + 串口打点）→ 校验通过且无升级请求则跳转。
+Boot 主流程：`HAL_Init` → 时钟（HSE 起不来就 10 Hz 快闪报错，不装死）→ 读参数页 → 校验 APP 起始处的 MSP/PC 是否落在 `0x08004000`~`0x20005000` 内 → **500 ms 常规窗口**（LED 5 Hz 快闪，可手动发 `U` 请求升级）→ 校验通过且无请求则跳转。
 
 跳转做了三件容易被忽略的事：`__disable_irq()`、`SCB->VTOR = APP 地址`、`__set_MSP(APP 栈顶)` 之后才 `((void(*)(void))复位向量)()`。APP 侧 `main()` 开头也重设一次 `VTOR`，这样 APP 单独烧到 `0x08000000` 调试时行为不变。
 
-**Boot 故意不驱动屏幕。** 它只有 4 KB，没有 ST7735 驱动，也不碰 PB10（背光）；`st7735_bl_on()` 是 APP 的 `st7735_init()` 最后一句。所以**只烧 Boot、或 APP 区还没有有效固件时，上电屏幕是全黑而不是白屏** —— 这是设计而非故障，此时唯一的指示是 PC13：
+**Boot 故意不驱动屏幕。** 它只有 5 KB，没有 ST7735 驱动，也不碰 PB10（背光）；`st7735_bl_on()` 是 APP 的 `st7735_init()` 最后一句。所以**只烧 Boot、或 APP 区还没有有效固件时，上电屏幕是全黑而不是白屏** —— 这是设计而非故障，此时唯一的指示是 PC13：
 
 | PC13 表现 | 含义 |
 |---|---|
-| 约 5 Hz 快闪，持续 3 秒后转为 APP 的 1 Hz | 正常：Boot 跑通并跳转成功 |
+| 5 Hz 快闪 0.5 秒后转为 APP 的 1 Hz | 正常：Boot 跑通并跳转成功 |
+| 2 Hz 慢闪最长 30 秒，之后跳 APP | 已进入升级等待窗口 |
 | 一直 5 Hz 慢闪不停 | APP 校验不过（没烧、或没烧到 `0x08004000`） |
 | 10 Hz 快闪 | 时钟起不来（HSE 异常） |
 
 接 CH340 到 PA9/PA10（115200）可以看到 Boot 日志：版本、参数状态、APP 地址与有效长度、`jumping to app...`。Boot 用寄存器直接操作 USART1（约 20 行），因为本工程 HAL 的 UART 模块是关着的 —— 这样做也省了 1~2 KB ROM。
+
+> 第①步最初是固定等 3 秒，每次开机都白等；第②步改成 500 ms 按需等待，详见下节。
+
+### OTA BootLoader 第二步：升级请求（2026-11-11）
+
+第①步每次开机都要在 Boot 里白等 3 秒，而且**没有任何办法让 APP 主动回到 Boot**。这一步把两件事一起解决。
+
+**三条进入升级等待的路径**
+
+| 触发方式 | 适用场合 |
+|---|---|
+| APP 运行时串口发 `U` | 正常升级：APP 写参数页 `upgrade_req=1` → `NVIC_SystemReset()` → Boot 读到标志停住 |
+| 上电后 500 ms 内串口发 `U` | APP 已经跑不起来时的手动入口（Boot 自己也能收命令） |
+| 参数页里预先写好 `upgrade_req=1` | 上位机 / 第③步流程使用 |
+
+**为什么标志必须跨复位存在**：复位会清空 RAM，Boot 和 APP 之间唯一的"信箱"就是 `0x0800FC00` 那 32 B 参数页。APP 侧直接复用 `boot/boot_param.c` + `boot_crc.c` + `boot_flash.c`（工程里新建 `Boot/Shared` 分组，IncludePath 加 `..\boot`），两边共用同一份结构体和 CRC，不会出现"APP 按 A 格式写、Boot 按 B 格式读"的错位。
+
+**标志是一次性的**：Boot 一读到 `upgrade_req=1` 就立刻清 0 写回，再进入等待。不清的话升级结束后每次复位都会再停一次，板子就永远回不了 APP。清失败时**直接忽略这次请求**（宁可丢一次升级，也不让每次开机白等 30 秒）。正常开机绝不擦写参数页，避免磨损 Flash。
+
+**超时回退**：`BOOT_UPGRADE_WAIT_MS = 30 s`，第③步的固件接收流程会占掉这个窗口；现在先做"等不到就跳回 APP"，保证误触发一次也不会变砖。
+
+| 常量 | 值 | 位置 |
+|---|---|---|
+| `BOOT_WAIT_MS` | `3000 → 500` ms | `boot/boot_cfg.h` |
+| `BOOT_UPGRADE_WAIT_MS` | `30000` ms | `boot/boot_cfg.h` |
+| `BOOT_CMD_CHAR` | `'U'`（大小写都认） | `boot/boot_cfg.h` |
+
+**APP 侧实现**（`mdk/app/app_upgrade.c`）：USART1 RXNE 中断只置一个 `volatile` 标志，不调用任何 FreeRTOS API；`heartbeat_task` 从 1 s 一次改为 **20 × 50 ms** 的节拍（LED 仍是 1 Hz），每 50 ms 查一次标志，命中就挂起调度器 → 擦写参数页 → `NVIC_SystemReset()`（不用关中断：APP 的 HAL 时基是 TIM7 中断，Flash 擦写靠 `HAL_GetTick()` 判超时，关中断会把时基冻住）。RX 脚 PA10 补了上拉，避免没接 CH340 时浮空噪声造成误触发。
+
+**验证方法**（需要 CH340：TX→PA10、RX→PA9、共地，115200 8N1）
+
+1. 两个 hex 都重烧，正常上电 → **约 0.5 秒**后屏亮（原来 3 秒），串口打印 `waiting 500 ms ('U' to upgrade)...` 后 `jumping to app...`。
+2. 天气时钟跑起来后，串口助手发送一个字符 `U` → APP 打印 `[OTA] upgrade requested -> reboot to BootLoader` 并立刻复位。
+3. Boot 打印 `upgrade_req found -> stay in boot`、`waiting for firmware 30000 ms...`，PC13 改为 **2 Hz 慢闪**，屏幕保持全黑（Boot 不驱动屏）。
+4. 30 秒后打印 `timeout -> fallback to app` → 跳回天气时钟，界面恢复正常。
+
+> 没接 CH340 也能验证第 1 条：上电到屏亮明显变快，就说明 500 ms 窗口生效了。
 
 ## 目录结构
 
@@ -198,16 +236,17 @@ weather_clock/
 │   ├── hardware.jpg / screen.jpg
 │   └── demo-offline.gif / demo-online.gif
 ├── boot/                    OTA BootLoader 源码（编到 0x08000000，16 KB 分区）
-│   ├── boot_main.c          主流程：时钟 → 参数 → 校验 APP → 3 秒窗口 → 跳转
+│   ├── boot_main.c          主流程：时钟 → 参数 → 500 ms 窗口 → 升级等待/跳转
 │   ├── boot_jump.c          MSP/PC 合法性检查 + 关中断 + 设 VTOR + 跳转
 │   ├── boot_flash.c         内部 Flash 擦写 + APP 有效长度测量
 │   ├── boot_param.c         参数页（0x0800FC00）读写
 │   └── boot_crc.c           CRC32（poly 0xEDB88320，表驱动）
 ├── mdk/                     Keil MDK 工程（APP）
 │   ├── Freertos的嵌入式智能天气时钟.uvprojx
-│   ├── app/                 应用层：天气解析、字库、开机动画、图标在 Flash 中的布局
+│   ├── app/                 应用层：天气解析、字库、开机动画、图标布局、app_upgrade.c
 │   ├── driver/              外设驱动：st7735 / esp-at / mpu6050 / w25q / led / rtc
-│   └── user/                任务实现 freertos_demo.c、本地配置 wifi_config.h
+│   ├── user/                任务实现 freertos_demo.c、本地配置 wifi_config.h
+│   └── Boot/Shared 分组     复用 ../boot 的参数页代码（同一份结构体与 CRC）
 └── mdk_boot/                Keil MDK 工程（Boot，独立工程）
     └── BootLoader.uvprojx
 ```
@@ -253,30 +292,30 @@ weather_clock/
 ## 资源占用（实测，Keil V5.06 编译结果）
 
 ```
-Program Size: Code=16516  RO-data=4356  RW-data=256  ZI-data=17776
+Program Size: Code=17948  RO-data=4356  RW-data=260  ZI-data=17812
 ```
 
 | 项目 | 占用 | 总容量 | 使用率 |
 |---|---|---|---|
-| Flash（Code + RO + RW） | 21 128 B ≈ **20.6 KB** | 64 KB | 32.2% |
-| RAM（RW + ZI） | 18 032 B ≈ **17.6 KB** | 20 KB | 88.0% |
+| Flash（Code + RO + RW） | 22 564 B ≈ **22.0 KB** | 64 KB | 34.4% |
+| RAM（RW + ZI） | 18 072 B ≈ **17.6 KB** | 20 KB | 88.2% |
 
-> 数值含本地 WiFi 账号字符串，换用不同长度的 SSID 会有几十字节偏差。Code 比外置前多 12 B，是 `main()` 里新增的 `SCB->VTOR` 那几行。
+> 数值含本地 WiFi 账号字符串，换用不同长度的 SSID 会有几十字节偏差。相比图标外置完成时（21 128 B）多出的约 1.4 KB，是第②步的参数页写入、CRC32、串口中断与升级请求逻辑。
 
 **Boot 侧（`mdk_boot/BootLoader.uvprojx`）**
 
 ```
-Program Size: Code=3840  RO-data=320  RW-data=20  ZI-data=1060
+Program Size: Code=5020  RO-data=320  RW-data=20  ZI-data=1092
 ```
 
 | 项目 | 占用 | 总容量 | 使用率 |
 |---|---|---|---|
-| Boot Flash | 4 180 B | 16 KB | 25.5% |
-| Boot RAM | 1 080 B | 20 KB | 5.3% |
+| Boot Flash | 5 360 B | 16 KB | 32.7% |
+| Boot RAM | 1 112 B | 20 KB | 5.4% |
 
-Boot 只链了 HAL 的 GPIO / RCC / FLASH / PWR / CORTEX 五类模块，没链 UART（串口用寄存器写）、没链屏驱动、没链 FreeRTOS，所以 4 KB 就够，16 KB 里还剩 11.8 KB 留给后面的串口/CAN 接收流程。
+Boot 只链了 HAL 的 GPIO / RCC / FLASH / PWR / CORTEX 五类模块，没链 UART（串口用寄存器写）、没链屏驱动、没链 FreeRTOS，所以 5 KB 就够，16 KB 里还剩约 11 KB 留给第③步的固件接收流程。
 
-**图标外置前后的体积账**
+**图标外置前后的体积账**（下表是 11-11 图标外置完成时的快照，之后第②步又加了约 1.4 KB）
 
 | | Flash | RO-data | RAM |
 |---|---|---|---|
@@ -285,8 +324,8 @@ Boot 只链了 HAL 的 GPIO / RCC / FLASH / PWR / CORTEX 五类模块，没链 U
 | 变化 | **−27 104 B** | −27 696 B | +96 B |
 
 - 省下的 27 KB 就是 6 张 48×48 RGB565 图标；RAM 只多了 `draw_icon_flash()` 里那一行 96 B 的读缓冲。
-- 若套用 16 KB Boot + 47 KB APP 的 OTA 分区：APP 可用 **48 128 B**，当前占用 **21 128 B（43.9%）**，余量 **27 000 B** —— 从「超出 104 B」变成「装得下且有两个版本迭代空间」，OTA 的分区前提已经消除。
-- RAM 只剩 **2.2 KB**。移植 BootLoader 后若要与 APP 共享缓冲区，仍需重新核算任务栈与堆，不能直接把图标整张读进来。
+- 若套用 16 KB Boot + 47 KB APP 的 OTA 分区：APP 可用 **48 128 B**，当前占用 **22 564 B（46.9%）**，余量 **25 564 B** —— 从「超出 104 B」变成「装得下且有两个版本迭代空间」，OTA 的分区前提已经消除。
+- RAM 只剩 **2.4 KB**（20 KB − 18 072 B）。移植 BootLoader 后若要与 APP 共享缓冲区，仍需重新核算任务栈与堆，不能直接把图标整张读进来。
 
 ## 真机验证记录（2026-11-10）
 
@@ -362,7 +401,7 @@ Boot 只链了 HAL 的 GPIO / RCC / FLASH / PWR / CORTEX 五类模块，没链 U
 - [x] **多任务重构**：`ui_task` / `net_task` / `heartbeat_task` + 队列 / 互斥量 / 二值信号量 / 栈水位监控，真机验证通过
 - [x] **图标外置到 W25Q**：27 KB 图标移出片内 Flash，固件 48 232 B → 21 128 B，`ICON OK 27648B` 逐字节校验通过
 - [x] **BootLoader 骨架（第①步）**：`boot/` + `mdk_boot/` 独立工程，16 KB 分区、参数页、MSP/PC 校验、3 秒窗口、VTOR 跳转；APP 已迁到 `0x08004000`，真机两级启动通过
-- [ ] 第②步：APP 内加"请求升级"入口（写参数页标志 + `NVIC_SystemReset()`），不再依赖拔电
+- [x] **第②步：升级请求（代码完成，真机验证待补）**：APP 串口 `U` → 写参数页 `upgrade_req` → 复位回 Boot；Boot 窗口 3 s → 0.5 s，清一次性标志 + 30 s 超时回退不变砖
 - [ ] 第③步：串口升级通路（收固件 → W25Q `0x020000` 暂存 → CRC32 校验 → 擦写 APP → 复位）
 - [ ] 第④步：失败保护（`boot_try` 计数、APP 无效停 Boot、超限不跳转），故意传坏包验证不变砖
 

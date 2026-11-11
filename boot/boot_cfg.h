@@ -31,7 +31,17 @@
 #define RAM_START_ADDR        0x20000000UL
 #define RAM_END_ADDR          0x20005000UL      /* C8T6 = 20 KB */
 
-/* 上电等在 Boot 里的时间窗口（毫秒）：这段时间内可以发起升级 */
-#define BOOT_WAIT_MS          3000UL
+/* 上电后在 Boot 里的常规窗口（毫秒）。
+ * 第①步是固定 3 秒，每次开机都白等；第②步改成 500 ms —— 只有真的收到
+ * 升级请求（参数页标志，或这个窗口里串口发来的命令字符）才会长等。 */
+#define BOOT_WAIT_MS          500UL
+
+/* 确认要升级后停留的等待时间（毫秒）。第③步的固件接收流程会占用这个窗口，
+ * 现在先做超时回退：等不到就跳回 APP，保证板子不会因为一次误触发而卡住。 */
+#define BOOT_UPGRADE_WAIT_MS  30000UL
+
+/* 手动进入升级的单字符命令。Boot 窗口和 APP 运行时都认它，
+ * 这样即使 APP 坏了、跑不起来，也能在复位瞬间从 Boot 手动进升级。 */
+#define BOOT_CMD_CHAR         'U'
 
 #endif /* __BOOT_CFG_H__ */

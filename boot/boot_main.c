@@ -1,11 +1,19 @@
 /**
  ******************************************************************************
  * @file    boot_main.c
- * @brief   OTA BootLoader 主程序（第①步：能跳、能记录状态）
+ * @brief   OTA BootLoader 主程序（第②步：按需等待 + 升级请求）
  *
  * 上电后的完整动作：
  *   初始化时钟/串口/LED → 读参数页 → 检查 APP 是否可跳
- *   → 留 3 秒窗口等升级请求 → 无请求且 APP 正常就跳过去
+ *   → 500 ms 常规窗口（LED 5 Hz 快闪，期间串口发 'U' 可手动请求升级）
+ *   → 若参数页有升级请求 / 收到命令：立刻清标志，进入 30 s 升级等待
+ *   → 等不到就回退跳 APP，绝不因为一次误触发把板子卡死
+ *
+ * LED 语言（不用接串口也能判断状态）：
+ *   5 Hz 快闪 0.5 s 后跳走  = 正常启动
+ *   2 Hz 慢闪最长 30 s      = 已进入升级等待
+ *   10 Hz 快闪不停          = HSE 时钟起不来
+ *   5 Hz 慢闪不停           = APP 无效 / 校验不通过，停在 Boot
  *
  * 烧录设置（务必确认，否则会把自己锁死）：
  *   IROM1 起始 0x08000000，大小 0x4000（16 KB）
@@ -45,6 +53,12 @@ static void boot_uart_init(void)
     USART1->CR2 = 0;
     USART1->CR3 = 0;
     USART1->CR1 = USART_CR1_UE | USART_CR1_TE | USART_CR1_RE;   /* 8N1 */
+
+    /* 清空复位前可能残留在接收寄存器里的字节。
+     * 从 APP 复位过来时，串口线上偶尔会挂着一个噪声字节；
+     * 不清的话 500 ms 窗口里可能被误读成升级命令。 */
+    (void)USART1->SR;
+    (void)USART1->DR;
 }
 
 static void boot_uart_send(const char *s, uint16_t len)
@@ -103,6 +117,22 @@ static void boot_log_hex(uint32_t v)
         buf[2 + i] = hex[(v >> ((7 - i) * 4)) & 0x0F];
     buf[10] = '\0';
     boot_log(buf);
+}
+
+/** 非阻塞收一个字符：没有数据时立刻返回 -1，绝不等待。
+ *
+ *  为什么不用中断：Boot 里没有 RTOS，也没有中断向量重定位的负担，
+ *  但第③步收固件时是"一次一包"的阻塞流程，用中断反而要做环形缓冲。
+ *  这里只需要在等待窗口里轮询，10 ms 一次足够 —— RXNE 是一直锁存的，
+ *  读 DR 之前不会丢，单字符命令不存在溢出问题。 */
+static int boot_uart_getchar(void)
+{
+    if ((USART1->SR & USART_SR_RXNE) == 0)
+        return -1;
+
+    /* 顺手把溢出/噪声错误标志清掉：先读 SR 再读 DR 是 F1 的规定顺序 */
+    (void)USART1->SR;
+    return (int)(USART1->DR & 0xFF);
 }
 
 /* ---------------- 板级初始化 ---------------- */
@@ -219,26 +249,66 @@ int main(void)
     }
     boot_log("\r\n");
 
-    /* 3 秒窗口：LED 快闪 + 串口打点，让人一眼看出"现在还在 Boot 里"。
-     * 日后加了升级请求通道（串口/CAN/W25Q 标志），就在这里判断要不要留。 */
-    boot_log("waiting ");
-    boot_log_u32(BOOT_WAIT_MS);
-    boot_log(" ms...\r\n");
-
-    for (uint32_t t = 0; t < BOOT_WAIT_MS; t += 100)
-    {
-        boot_led_toggle();
-        boot_log(".");
-        HAL_Delay(100);
-    }
-    boot_log("\r\n");
-
+    /* 参数页里的请求是"一次性"的：读到就立刻清 0 再写回。
+     * 不清的话，这次升级结束、下一次复位时 Boot 又会以为有请求，
+     * 板子就永远停在 Boot —— 这是单分区 OTA 最容易踩的坑。
+     * 注意：只在真的有请求时才擦写参数页，正常开机绝不写，避免磨损 Flash。 */
+    int stay_for_upgrade = 0;
     if (g_param.upgrade_req)
     {
-        /* 第③步在这里接固件接收流程；现在先老实待着，不乱跳 */
-        boot_log("upgrade requested -> stay in boot\r\n");
+        g_param.upgrade_req = 0;
+        if (boot_param_write(&g_param))
+        {
+            stay_for_upgrade = 1;
+            boot_log("upgrade_req found -> stay in boot\r\n");
+        }
+        else
+        {
+            /* 清不掉就别停：否则每次开机都白等 30 秒，比丢一次请求更糟。 */
+            boot_log("WARN: clear upgrade_req failed, ignore request\r\n");
+        }
     }
-    else if (boot_app_check(APP_START_ADDR))
+
+    /* 常规窗口：500 ms、LED 5 Hz 快闪。
+     * 期间串口发来 'U'（大小写都认）也能手动进升级 —— APP 跑不起来时，
+     * 这是唯一还能进 Boot 升级流程的入口。 */
+    boot_log("waiting ");
+    boot_log_u32(BOOT_WAIT_MS);
+    boot_log(" ms ('U' to upgrade)...\r\n");
+
+    for (uint32_t t = 0; t < BOOT_WAIT_MS; t += 10)
+    {
+        if ((t % 100) == 0)
+            boot_led_toggle();
+
+        int ch = boot_uart_getchar();
+        if (ch == BOOT_CMD_CHAR || ch == (BOOT_CMD_CHAR + 0x20))
+        {
+            stay_for_upgrade = 1;
+            boot_log("\r\nmanual upgrade request\r\n");
+            break;
+        }
+        HAL_Delay(10);
+    }
+
+    /* 升级等待窗口。第③步会把这个循环换成"收固件 → 写 W25Q → CRC 校验"，
+     * 现在先做超时回退：请求了但没接上位机，也能自己回到 APP，不会变砖。 */
+    if (stay_for_upgrade)
+    {
+        boot_log("waiting for firmware ");
+        boot_log_u32(BOOT_UPGRADE_WAIT_MS);
+        boot_log(" ms...\r\n");
+
+        for (uint32_t elapsed = 0; elapsed < BOOT_UPGRADE_WAIT_MS; elapsed += 10)
+        {
+            if ((elapsed % 250) == 0)
+                boot_led_toggle();          /* 2 Hz 慢闪，和启动窗口区分开 */
+            HAL_Delay(10);
+        }
+        boot_log("timeout -> fallback to app\r\n");
+    }
+
+    if (boot_app_check(APP_START_ADDR))
     {
         boot_log("jumping to app...\r\n");
         HAL_Delay(10);                       /* 等最后一个字节发完 */
@@ -253,6 +323,6 @@ int main(void)
     while (1)
     {
         boot_led_toggle();
-        HAL_Delay(200);                      /* 停在 Boot：5 Hz 慢闪等升级 */
+        HAL_Delay(100);                      /* 停在 Boot：5 Hz 慢闪等升级 */
     }
 }
