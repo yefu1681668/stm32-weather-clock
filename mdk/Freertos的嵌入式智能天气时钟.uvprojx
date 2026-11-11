@@ -336,7 +336,7 @@
               <MiscControls></MiscControls>
               <Define>USE_HAL_DRIVER,STM32F103xE</Define>
               <Undefine></Undefine>
-              <IncludePath>..\Core\Inc;..\Drivers\STM32F1xx_HAL_Driver\Inc;..\Drivers\STM32F1xx_HAL_Driver\Inc\Legacy;..\Drivers\CMSIS\Device\ST\STM32F1xx\Include;..\Drivers\CMSIS\Include;..\FreeRTOS\include;..\FreeRTOS\portable\RVDS\ARM_CM3;.\app;.\app\icon;.\driver;.\driver\st7735;.\driver\esp-at;.\driver\mpu6050;.\user</IncludePath>
+              <IncludePath>..\Core\Inc;..\Drivers\STM32F1xx_HAL_Driver\Inc;..\Drivers\STM32F1xx_HAL_Driver\Inc\Legacy;..\Drivers\CMSIS\Device\ST\STM32F1xx\Include;..\Drivers\CMSIS\Include;..\FreeRTOS\include;..\FreeRTOS\portable\RVDS\ARM_CM3;.\app;.\driver;.\driver\st7735;.\driver\esp-at;.\driver\mpu6050;.\driver\w25q;.\user</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -406,36 +406,6 @@
               <FilePath>.\app\delay.c</FilePath>
             </File>
             <File>
-              <FileName>icon_weather_duoyun.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\app\icon\icon_weather_duoyun.c</FilePath>
-            </File>
-            <File>
-              <FileName>icon_weather_feng.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\app\icon\icon_weather_feng.c</FilePath>
-            </File>
-            <File>
-              <FileName>icon_weather_qing.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\app\icon\icon_weather_qing.c</FilePath>
-            </File>
-            <File>
-              <FileName>icon_weather_xue.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\app\icon\icon_weather_xue.c</FilePath>
-            </File>
-            <File>
-              <FileName>icon_weather_yin.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\app\icon\icon_weather_yin.c</FilePath>
-            </File>
-            <File>
-              <FileName>icon_weather_yu.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\app\icon\icon_weather_yu.c</FilePath>
-            </File>
-            <File>
               <FileName>freertos_demo.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\user\freertos_demo.c</FilePath>
@@ -489,6 +459,11 @@
               <FileName>swi2c.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\driver\mpu6050\swi2c.c</FilePath>
+            </File>
+            <File>
+              <FileName>w25q.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\driver\w25q\w25q.c</FilePath>
             </File>
           </Files>
         </Group>

@@ -10,7 +10,6 @@
 #include <string.h>
 #include "st7735.h"
 #include "stfonts.h"
-#include "stimage.h"
 #include "esp_at.h"
 #include "rtc.h"
 #include "mpu6050.h"
@@ -18,6 +17,8 @@
 #include "led.h"
 #include "delay.h"
 #include "wifi_config.h"     /* WiFi 账号 / 天气 API key（本地私有，勿提交真实值） */
+#include "w25q.h"            /* 外部 SPI Flash: 天气图标外置用 */
+#include "icons_flash.h"     /* 图标在 W25Q 里的固定偏移 */
 
 /* 调试: ESP32最后响应长度 */
 extern uint32_t esp_at_last_rxlen;
@@ -114,6 +115,7 @@ static uint8_t  g_wifi_ok = 0;          /* WiFi是否连接成功 */
 static int16_t  g_out_temp_x10 = 999;   /* 室外温度x10, 999=未知 */
 static char     g_out_weather[16] = "--";  /* 天气文字 */
 static uint8_t  g_humidity = 0xFF;      /* 湿度%, 0xFF=未知(接口没给) */
+static uint8_t  g_w25q_ok = 0;          /* W25Q 通讯正常才画图标, 否则不画(读回全1是白块) */
 
 /* 栈水位历史最小值, 供调试器观察 (heartbeat_task 每 20s 刷新) */
 static volatile UBaseType_t g_stack_min_ui  = 0xFFFF;
@@ -306,7 +308,12 @@ static void draw_wifi_icon(uint16_t x, uint16_t y, uint8_t connected)
     }
 }
 
-/** 2:1缩放绘制RGB565图片 (用于把48x48图标显示为24x24)
+/** 从 W25Q 流式读一张 48x48 RGB565 图标, 2:1 抽样画成 24x24
+ *
+ *  为什么不能"整个读出来再画": 一张图标 48*48*2 = 4608 B, 六张 27 KB,
+ *  C8T6 一共只有 20 KB RAM(FreeRTOS 堆才 6 KB 左右), 根本放不下。
+ *  所以按【行】读: 每次只读一整行 48 像素 = 96 B, 画完这一行再读下一行,
+ *  RAM 里始终只有这 96 B(static, 不占任务栈)。
  *
  *  两个关键点(原来都写错了):
  *  ① 图标数据是【小端】存放的: 先低字节、后高字节。
@@ -315,20 +322,34 @@ static void draw_wifi_icon(uint16_t x, uint16_t y, uint8_t connected)
  *     原来照抄着画, 屏上就出现一个 24x24 的黑方块贴在橙色面板上。
  *     这里遇到纯黑直接跳过, 让下面已经刷好的面板底色透出来。
  *     (图标自身的描边是深藏青/深灰, 不是纯黑, 不会被误删。) */
-static void draw_image_scaled(uint16_t x, uint16_t y,
-                              const uint8_t *data, uint16_t w, uint16_t h)
+static void draw_icon_flash(uint16_t x, uint16_t y, uint32_t off)
 {
-    for (uint16_t py = 0; py < h; py += 2)
+    static uint8_t row[ICON_W * 2];     /* 一整行: 48 像素 x 2 B = 96 B */
+
+    for (uint16_t py = 0; py < ICON_H; py += 2)
     {
-        for (uint16_t px = 0; px < w; px += 2)
+        w25q_read(off + (uint32_t)py * ICON_W * 2, row, sizeof(row));
+
+        for (uint16_t px = 0; px < ICON_W; px += 2)
         {
-            uint32_t idx = ((uint32_t)py * w + px) * 2;
-            uint16_t color = ((uint16_t)data[idx + 1] << 8) | data[idx];
+            uint16_t color = ((uint16_t)row[px * 2 + 1] << 8) | row[px * 2];
             if (color == 0x0000)        /* 纯黑 = 透明, 保留面板底色 */
                 continue;
             st7735_draw_pixel(x + px / 2, y + py / 2, color);
         }
     }
+}
+
+/** 天气字符串 -> 图标在 W25Q 里的偏移; 认不出来返回 ICON_OFF_NONE */
+static uint32_t icon_offset_by_name(const char *w)
+{
+    if (strcmp(w, "Cloudy") == 0)                            return ICON_OFF_DUOYUN;
+    if (strcmp(w, "Wind") == 0)                              return ICON_OFF_FENG;
+    if (strcmp(w, "Clear") == 0 || strcmp(w, "Sunny") == 0)   return ICON_OFF_QING;
+    if (strcmp(w, "Snow") == 0)                              return ICON_OFF_XUE;
+    if (strcmp(w, "Overcast") == 0)                          return ICON_OFF_YIN;
+    if (strcmp(w, "Rain") == 0)                              return ICON_OFF_YU;
+    return ICON_OFF_NONE;
 }
 
 /* ---------- FreeRTOS启动 ---------- */
@@ -614,18 +635,13 @@ static void ui_update_weather(void)
     draw_cn_word(W_PANEL + 16, Y_PANEL + 4, CN_QI, CN_WEN,
                  COL_TEXT_W, COL_OUTDOOR_BG);
 
-    /* 天气图标 (48x48 缩放到 24x24, 放在标签下方左侧) */
-    const st_image_t *img = NULL;
-    if (strcmp(g_out_weather, "Cloudy") == 0)        img = &icon_weather_duoyun;
-    else if (strcmp(g_out_weather, "Wind") == 0)     img = &icon_weather_feng;
-    else if (strcmp(g_out_weather, "Clear") == 0)    img = &icon_weather_qing;
-    else if (strcmp(g_out_weather, "Sunny") == 0)    img = &icon_weather_qing;
-    else if (strcmp(g_out_weather, "Snow") == 0)     img = &icon_weather_xue;
-    else if (strcmp(g_out_weather, "Overcast") == 0) img = &icon_weather_yin;
-    else if (strcmp(g_out_weather, "Rain") == 0)     img = &icon_weather_yu;
+    /* 天气图标 (48x48 -> 24x24, 数据在 W25Q 里, 按行流式读) */
+    uint32_t icoff = icon_offset_by_name(g_out_weather);
 
-    if (img)
-        draw_image_scaled(W_PANEL + 2, Y_PANEL + 20, img->data, img->width, img->height);
+    if (icoff == ICON_OFF_NONE || !g_w25q_ok)
+        icoff = ICON_OFF_NONE;          /* 认不出天气 或 W25Q 没通: 不画图标 */
+    else
+        draw_icon_flash(W_PANEL + 2, Y_PANEL + 20, icoff);
 
     /* 室外温度 (ASCII字体, 带°C) */
     char tstr[10];
@@ -645,7 +661,7 @@ static void ui_update_weather(void)
      * 有图标时: 图标占 x=66~89, 文字放 93~124;
      * 无图标时: 文字直接居中 x = 64 + (64-32)/2 = 80。
      * 垂直方向与 24px 高的图标居中对齐: y = 80+20 + (24-16)/2 = 104 */
-    st7735_write_string(img ? (W_PANEL + 29) : (W_PANEL + 16),
+    st7735_write_string((icoff != ICON_OFF_NONE) ? (W_PANEL + 29) : (W_PANEL + 16),
                         Y_PANEL + 24, tstr,
                         &font_ascii_8x16, COL_TEXT_W, COL_OUTDOOR_BG);
 }
@@ -717,6 +733,26 @@ static uint8_t net_fetch_humidity(uint8_t *humi)
         return 0;
     *humi = h;
     return 1;
+}
+
+/* ---------- W25Q 开机自检 ----------
+ * 6 张天气图标已经全部搬到 W25Q, 所以这块外部 Flash 从"可选"变成"必需":
+ * 读不到就画不出图标。板子没有 printf, 唯一能看见的窗口就是屏,
+ * 所以只在【失败】时于日期行打一行红字, 成功时完全不打扰界面。
+ * 自检只读 JEDEC ID, 不写不擦, 绝不会破坏图标数据。 */
+static void w25q_boot_check(void)
+{
+    g_w25q_ok = w25q_init() ? 1 : 0;
+
+    if (g_w25q_ok)
+        return;                     /* 正常: 不占用启动时间, 不闪屏 */
+
+    st7735_fill_rect(0, Y_DATE, 128, H_DATE, COL_WHITE);
+    st7735_write_string(2, Y_DATE, "W25Q FAIL",
+                        &font_ascii_8x16, COL_TEMP_HI, COL_WHITE);
+
+    vTaskDelay(pdMS_TO_TICKS(2500));
+    ui_update_date();               /* 提示让位给真实日期, 界面继续正常跑 */
 }
 
 /* ---------- 三个任务的实现 ---------- */
@@ -810,6 +846,10 @@ static void ui_task(void *pvParameters)
     ui_update_time(1);
     ui_update_indoor();
     lcd_unlock();
+
+    /* W25Q 自检: 图标已外置, 这块 Flash 不通就画不出图标(失败时才提示)。
+     * 放在 give 之前, 此时 net_task 还拿不到闸门、不会碰屏, 无需抢互斥量。 */
+    w25q_boot_check();
 
     /* 放行网络任务: 从这一刻起 net_task 才能调用 net_progress() */
     xSemaphoreGive(g_lcd_ready);
