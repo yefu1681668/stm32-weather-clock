@@ -159,6 +159,32 @@ net_task:  xSemaphoreTake(g_lcd_ready)         屏没初始化好之前绝不碰
 
 1 MB 的 W25Q80 用不到 15%，容量不是瓶颈。开机只读一次 JEDEC ID：不通就在日期行打红字 `W25Q FAIL`，通路则完全不打扰界面，图标画不出来时自动退化为「只有温度没有图标」的排版，不会白块也不会死机。
 
+### OTA BootLoader 第一步（2026-11-11）
+
+图标搬出去腾出空间后，开始把固件拆成两级。**这一步只做"能启动、能跳转"，升级通路还没接。**
+
+内部 Flash 分区：
+
+| 区域 | 起始地址 | 大小 | 当前占用 |
+|---|---|---|---|
+| Boot | `0x08000000` | 16 KB | 4 180 B（25.5%） |
+| APP | `0x08004000` | 47 KB（`0xBC00`） | 21 128 B（43.9%） |
+| 参数页 | `0x0800FC00` | 1 KB | 升级标志 / `boot_try` 计数 |
+
+Boot 主流程：`HAL_Init` → 时钟（HSE 起不来就 10 Hz 快闪报错，不装死）→ 读参数页 → 校验 APP 起始处的 MSP/PC 是否落在 `0x08004000`~`0x20005000` 内 → **3 秒窗口**（LED 5 Hz 快闪 + 串口打点）→ 校验通过且无升级请求则跳转。
+
+跳转做了三件容易被忽略的事：`__disable_irq()`、`SCB->VTOR = APP 地址`、`__set_MSP(APP 栈顶)` 之后才 `((void(*)(void))复位向量)()`。APP 侧 `main()` 开头也重设一次 `VTOR`，这样 APP 单独烧到 `0x08000000` 调试时行为不变。
+
+**Boot 故意不驱动屏幕。** 它只有 4 KB，没有 ST7735 驱动，也不碰 PB10（背光）；`st7735_bl_on()` 是 APP 的 `st7735_init()` 最后一句。所以**只烧 Boot、或 APP 区还没有有效固件时，上电屏幕是全黑而不是白屏** —— 这是设计而非故障，此时唯一的指示是 PC13：
+
+| PC13 表现 | 含义 |
+|---|---|
+| 约 5 Hz 快闪，持续 3 秒后转为 APP 的 1 Hz | 正常：Boot 跑通并跳转成功 |
+| 一直 5 Hz 慢闪不停 | APP 校验不过（没烧、或没烧到 `0x08004000`） |
+| 10 Hz 快闪 | 时钟起不来（HSE 异常） |
+
+接 CH340 到 PA9/PA10（115200）可以看到 Boot 日志：版本、参数状态、APP 地址与有效长度、`jumping to app...`。Boot 用寄存器直接操作 USART1（约 20 行），因为本工程 HAL 的 UART 模块是关着的 —— 这样做也省了 1~2 KB ROM。
+
 ## 目录结构
 
 ```
@@ -171,11 +197,19 @@ weather_clock/
 ├── docs/                    实物照片 + 断网 A/B 对比演示 GIF
 │   ├── hardware.jpg / screen.jpg
 │   └── demo-offline.gif / demo-online.gif
-└── mdk/                     Keil MDK 工程
-    ├── Freertos的嵌入式智能天气时钟.uvprojx
-    ├── app/                 应用层：天气解析、字库、开机动画、图标在 Flash 中的布局
-    ├── driver/              外设驱动：st7735 / esp-at / mpu6050 / w25q / led / rtc
-    └── user/                任务实现 freertos_demo.c、本地配置 wifi_config.h
+├── boot/                    OTA BootLoader 源码（编到 0x08000000，16 KB 分区）
+│   ├── boot_main.c          主流程：时钟 → 参数 → 校验 APP → 3 秒窗口 → 跳转
+│   ├── boot_jump.c          MSP/PC 合法性检查 + 关中断 + 设 VTOR + 跳转
+│   ├── boot_flash.c         内部 Flash 擦写 + APP 有效长度测量
+│   ├── boot_param.c         参数页（0x0800FC00）读写
+│   └── boot_crc.c           CRC32（poly 0xEDB88320，表驱动）
+├── mdk/                     Keil MDK 工程（APP）
+│   ├── Freertos的嵌入式智能天气时钟.uvprojx
+│   ├── app/                 应用层：天气解析、字库、开机动画、图标在 Flash 中的布局
+│   ├── driver/              外设驱动：st7735 / esp-at / mpu6050 / w25q / led / rtc
+│   └── user/                任务实现 freertos_demo.c、本地配置 wifi_config.h
+└── mdk_boot/                Keil MDK 工程（Boot，独立工程）
+    └── BootLoader.uvprojx
 ```
 
 工程文件使用 `..\Core`、`..\Drivers`、`..\FreeRTOS` 相对路径引用上层目录，因此**必须保持上述目录结构**，不可只复制 `mdk/`。
@@ -193,9 +227,11 @@ weather_clock/
 
    > 仓库中该文件是占位符版本（`YOUR_WIFI_SSID` 等），不填无法联网，但能正常编译。照片与录屏里的 SSID 是实机调试用的真实热点名，配置文件本身不含任何真实凭据。
 
-2. **打开工程**：Keil MDK 打开 `mdk/Freertos的嵌入式智能天气时钟.uvprojx`
-3. **编译烧录**：`F7` 编译 → `F8` 下载（ST-Link，起始地址 `0x08000000`，BOOT0 接 GND）
-4. **上电观察**：LED 慢闪 3 次（启动标志）→ 屏幕出完整界面，中间提示行依次走 `1/4 Init ESP...` → `2/4 STA Mode...` → `3/4 <SSID>...` → `4/4 SNTP Sync...` → 进入时钟界面，LED 转为稳定 1 Hz 慢闪
+2. **打开工程**（现在是两个独立工程，先 Boot 后 APP）：
+   - Boot：`mdk_boot/BootLoader.uvprojx`，IROM 起始 `0x08000000`，大小 `0x4000`
+   - APP：`mdk/Freertos的嵌入式智能天气时钟.uvprojx`，IROM 起始 `0x08004000`，大小 `0xBC00`
+3. **编译烧录**：`F7` 编译 → `F8` 下载（ST-Link，BOOT0 接 GND）。**两个都必须烧**，只烧 Boot 屏幕不会亮（Boot 不驱动屏幕，详见下节）。首次打开 Boot 工程如果弹 `No ULINK2/ME Device found`，是调试器默认选中了 ULINK2，在 `Options for Target → Debug → Use:` 里改成 `ST-Link Debugger` 即可。
+4. **上电观察**：PC13 快闪约 3 秒（Boot 窗口）→ 屏幕亮起、中间提示行依次走 `1/4 Init ESP...` → `2/4 STA Mode...` → `3/4 <SSID>...` → `4/4 SNTP Sync...` → 进入时钟界面，LED 转为稳定 1 Hz 慢闪
 
 ### 排障提示（都是真机踩过的坑）
 
@@ -217,26 +253,39 @@ weather_clock/
 ## 资源占用（实测，Keil V5.06 编译结果）
 
 ```
-Program Size: Code=16504  RO-data=4356  RW-data=256  ZI-data=17776
+Program Size: Code=16516  RO-data=4356  RW-data=256  ZI-data=17776
 ```
 
 | 项目 | 占用 | 总容量 | 使用率 |
 |---|---|---|---|
-| Flash（Code + RO + RW） | 21 116 B ≈ **20.6 KB** | 64 KB | 32.3% |
+| Flash（Code + RO + RW） | 21 128 B ≈ **20.6 KB** | 64 KB | 32.2% |
 | RAM（RW + ZI） | 18 032 B ≈ **17.6 KB** | 20 KB | 88.0% |
 
-> 数值含本地 WiFi 账号字符串，换用不同长度的 SSID 会有几十字节偏差。
+> 数值含本地 WiFi 账号字符串，换用不同长度的 SSID 会有几十字节偏差。Code 比外置前多 12 B，是 `main()` 里新增的 `SCB->VTOR` 那几行。
+
+**Boot 侧（`mdk_boot/BootLoader.uvprojx`）**
+
+```
+Program Size: Code=3840  RO-data=320  RW-data=20  ZI-data=1060
+```
+
+| 项目 | 占用 | 总容量 | 使用率 |
+|---|---|---|---|
+| Boot Flash | 4 180 B | 16 KB | 25.5% |
+| Boot RAM | 1 080 B | 20 KB | 5.3% |
+
+Boot 只链了 HAL 的 GPIO / RCC / FLASH / PWR / CORTEX 五类模块，没链 UART（串口用寄存器写）、没链屏驱动、没链 FreeRTOS，所以 4 KB 就够，16 KB 里还剩 11.8 KB 留给后面的串口/CAN 接收流程。
 
 **图标外置前后的体积账**
 
 | | Flash | RO-data | RAM |
 |---|---|---|---|
 | 图标在片内（11-10） | 48 232 B | 32 052 B | 17 936 B |
-| 图标在 W25Q（11-11） | **21 116 B** | **4 356 B** | 18 032 B |
-| 变化 | **−27 116 B** | −27 696 B | +96 B |
+| 图标在 W25Q（11-11） | **21 128 B** | **4 356 B** | 18 032 B |
+| 变化 | **−27 104 B** | −27 696 B | +96 B |
 
 - 省下的 27 KB 就是 6 张 48×48 RGB565 图标；RAM 只多了 `draw_icon_flash()` 里那一行 96 B 的读缓冲。
-- 若套用 16 KB Boot + 47 KB APP 的 OTA 分区：APP 可用 **48 128 B**，当前占用 **21 116 B（43.9%）**，余量 **27 012 B** —— 从「超出 104 B」变成「装得下且有两个版本迭代空间」，OTA 的分区前提已经消除。
+- 若套用 16 KB Boot + 47 KB APP 的 OTA 分区：APP 可用 **48 128 B**，当前占用 **21 128 B（43.9%）**，余量 **27 000 B** —— 从「超出 104 B」变成「装得下且有两个版本迭代空间」，OTA 的分区前提已经消除。
 - RAM 只剩 **2.2 KB**。移植 BootLoader 后若要与 APP 共享缓冲区，仍需重新核算任务栈与堆，不能直接把图标整张读进来。
 
 ## 真机验证记录（2026-11-10）
@@ -311,8 +360,11 @@ Program Size: Code=16504  RO-data=4356  RW-data=256  ZI-data=17776
 - [x] 裸机版 → FreeRTOS 重构，Keil 编译 0 Error / 0 Warning
 - [x] 全部功能真机验证通过（显示 / 对时 / 联网 / 天气 / 湿度）
 - [x] **多任务重构**：`ui_task` / `net_task` / `heartbeat_task` + 队列 / 互斥量 / 二值信号量 / 栈水位监控，真机验证通过
-- [x] **图标外置到 W25Q**：27 KB 图标移出片内 Flash，固件 48 232 B → 21 116 B，`ICON OK 27648B` 逐字节校验通过
-- [ ] 移植 OTA BootLoader（`0x08000000` 16 KB Boot + `0x08004000` APP 47 KB，现余量 27 012 B）
+- [x] **图标外置到 W25Q**：27 KB 图标移出片内 Flash，固件 48 232 B → 21 128 B，`ICON OK 27648B` 逐字节校验通过
+- [x] **BootLoader 骨架（第①步）**：`boot/` + `mdk_boot/` 独立工程，16 KB 分区、参数页、MSP/PC 校验、3 秒窗口、VTOR 跳转；APP 已迁到 `0x08004000`，真机两级启动通过
+- [ ] 第②步：APP 内加"请求升级"入口（写参数页标志 + `NVIC_SystemReset()`），不再依赖拔电
+- [ ] 第③步：串口升级通路（收固件 → W25Q `0x020000` 暂存 → CRC32 校验 → 擦写 APP → 复位）
+- [ ] 第④步：失败保护（`boot_try` 计数、APP 无效停 Boot、超限不跳转），故意传坏包验证不变砖
 
 ## 说明
 

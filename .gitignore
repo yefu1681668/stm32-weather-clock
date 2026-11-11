@@ -2,6 +2,12 @@
 mdk/Objects/
 mdk/Listings/
 mdk/DebugConfig/
+mdk_boot/Objects/
+mdk_boot/Listings/
+mdk_boot/DebugConfig/
+Objects/
+Listings/
+DebugConfig/
 mdk/build.log
 build.log
 *.log

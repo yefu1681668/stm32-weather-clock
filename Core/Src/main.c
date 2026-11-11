@@ -66,6 +66,15 @@ void SystemClock_Config(void);
 int main(void)
 {
   /* USER CODE BEGIN 1 */
+  /* ---------- OTA 分区（2026-11-11 起）----------
+   * APP 已经从 0x08000000 搬到 0x08004000，上电先跑 BootLoader，
+   * 由它设置好 MSP / VTOR 再跳到本函数。
+   *
+   * 这里再设一次 VTOR 是为了兜底：如果用 ST-Link 直接烧 APP 而不经过 Boot
+   * （调试时最常见），SCB->VTOR 还是复位默认值 0，中断会去 0x08000000
+   * 取向量 —— 那是 Boot 的向量表，句柄地址和 APP 完全对不上，一进中断就跑飞。
+   * 无条件重设一次，保证"经 Boot 跳进来"和"直接烧 APP"两种方式都能跑。 */
+  SCB->VTOR = 0x08004000UL;
 
   /* USER CODE END 1 */
 
