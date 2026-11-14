@@ -72,6 +72,15 @@ int boot_jump_to_app(uint32_t app_addr)
     return 1;                            /* 正常情况走不到这里 */
 }
 
+/* 扫描 APP 区内「最后一个非 0xFF 字节」的偏移 —— 只用于开机日志诊断，
+ * 【绝不能当作固件的真实长度】。
+ *
+ * Keil 的 Erase Sectors 只擦固件实际占用的页，APP 区后半段常常还留着
+ * 上一版大固件的残骸；只要靠后的位置有一个字节不是 0xFF，返回值就会被
+ * 撑到接近 0xBC00。真机实测：真实固件 22 564 B，这里打印 47 352 B。
+ *
+ * 第③步做 CRC32 校验 / 擦除 / 复制时，长度必须由上位机协议头给出
+ * （或写在 W25Q 暂存区的固件头里），不能靠扫描 0xFF 推断。 */
 uint32_t boot_app_measure_size(uint32_t app_addr, uint32_t max_size)
 {
     const uint8_t *p = (const uint8_t *)app_addr;

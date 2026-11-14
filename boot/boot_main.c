@@ -240,7 +240,9 @@ int main(void)
     boot_log_hex(APP_START_ADDR);
     if (boot_app_check(APP_START_ADDR))
     {
-        boot_log(" valid, size=");
+        /* scan_end 只是「最后一个非 0xFF 字节」的位置，含 APP 区残留旧数据，
+         * 不是固件真实长度。详见 boot_jump.c 里 boot_app_measure_size 的说明。 */
+        boot_log(" valid, scan_end=");
         boot_log_u32(boot_app_measure_size(APP_START_ADDR, APP_MAX_SIZE));
     }
     else

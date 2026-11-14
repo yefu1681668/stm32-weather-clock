@@ -167,7 +167,7 @@ net_task:  xSemaphoreTake(g_lcd_ready)         屏没初始化好之前绝不碰
 
 | 区域 | 起始地址 | 大小 | 当前占用 |
 |---|---|---|---|
-| Boot | `0x08000000` | 16 KB | 5 360 B（32.7%） |
+| Boot | `0x08000000` | 16 KB | 5 364 B（32.7%） |
 | APP | `0x08004000` | 47 KB（`0xBC00`） | 22 564 B（46.9%） |
 | 参数页 | `0x0800FC00` | 1 KB | 升级标志 / `boot_try` 计数 |
 
@@ -222,6 +222,28 @@ Boot 主流程：`HAL_Init` → 时钟（HSE 起不来就 10 Hz 快闪报错，�
 4. 30 秒后打印 `timeout -> fallback to app` → 跳回天气时钟，界面恢复正常。
 
 > 没接 CH340 也能验证第 1 条：上电到屏亮明显变快，就说明 500 ms 窗口生效了。
+
+### 11-14 真机串口日志与一个已知陷阱
+
+烧完两个 hex 后，SSCOM 5.13.1 / COM14 / 115200 8N1 抓到（完整的一轮）：
+
+```
+===== OTA BootLoader v0.1 =====
+param: fresh upgrade_req=0, boot_try=0
+app @0x08004000 valid, size=47352
+waiting 500 ms ('U' to upgrade)...
+jumping to app...
+```
+
+逐行读：参数页是出厂态（`fresh`）、没有待处理的升级请求；`0x08004000` 的向量表合法；**`waiting 500 ms` 证明新版 Boot 确实在跑**，`BOOT_WAIT_MS` 已从 3 s 降到 500 ms；最后成功跳转，约 0.5 s 屏亮、天气时钟正常。
+
+> 抓到两轮启动日志，第一轮少了 `waiting 500 ms` 那一行。这行在代码里是无条件打印的，所以大概率是 ST-Link 下载复位时 CH340 重新枚举丢了几个字节，不是固件问题。
+
+**`size=47352` 不是固件大小，别被它骗了。** 真实 APP 只有 22 564 B。`boot_app_measure_size()` 扫的是「APP 区里最后一个非 0xFF 字节」的位置，而 Keil 的 Erase Sectors 只擦固件实际占用的页，后面还残留着迁到 `0x08004000` 之前那版 48 KB 固件的残骸，于是扫描一路顶到接近 `0xBC00`。`boot_app_check()` 只看向量表的 MSP / PC，跟这个数字无关，所以跳转完全正常。
+
+已把日志措辞改成 `valid, scan_end=`，并在 `boot_jump.c` 里写明限制。**对第③步的硬约束**：CRC32 校验范围、擦除页数、从 W25Q 复制多少字节，都必须由上位机协议头里的 `length` 决定（或写进 W25Q 暂存区的固件头），**绝不能靠扫描 0xFF 推断长度** —— 否则会把残留垃圾一起算进去，校验永远对不上。
+
+**尚未验证**：上面两轮都是 `upgrade_req=0` → `jumping to app...`，只跑了正常启动；**APP 运行时发 `U` 回到 Boot** 这条链路还没测。
 
 ## 目录结构
 
@@ -305,12 +327,12 @@ Program Size: Code=17948  RO-data=4356  RW-data=260  ZI-data=17812
 **Boot 侧（`mdk_boot/BootLoader.uvprojx`）**
 
 ```
-Program Size: Code=5020  RO-data=320  RW-data=20  ZI-data=1092
+Program Size: Code=5024  RO-data=320  RW-data=20  ZI-data=1092
 ```
 
 | 项目 | 占用 | 总容量 | 使用率 |
 |---|---|---|---|
-| Boot Flash | 5 360 B | 16 KB | 32.7% |
+| Boot Flash | 5 364 B | 16 KB | 32.7% |
 | Boot RAM | 1 112 B | 20 KB | 5.4% |
 
 Boot 只链了 HAL 的 GPIO / RCC / FLASH / PWR / CORTEX 五类模块，没链 UART（串口用寄存器写）、没链屏驱动、没链 FreeRTOS，所以 5 KB 就够，16 KB 里还剩约 11 KB 留给第③步的固件接收流程。
@@ -401,8 +423,8 @@ Boot 只链了 HAL 的 GPIO / RCC / FLASH / PWR / CORTEX 五类模块，没链 U
 - [x] **多任务重构**：`ui_task` / `net_task` / `heartbeat_task` + 队列 / 互斥量 / 二值信号量 / 栈水位监控，真机验证通过
 - [x] **图标外置到 W25Q**：27 KB 图标移出片内 Flash，固件 48 232 B → 21 128 B，`ICON OK 27648B` 逐字节校验通过
 - [x] **BootLoader 骨架（第①步）**：`boot/` + `mdk_boot/` 独立工程，16 KB 分区、参数页、MSP/PC 校验、3 秒窗口、VTOR 跳转；APP 已迁到 `0x08004000`，真机两级启动通过
-- [x] **第②步：升级请求（代码完成，真机验证待补）**：APP 串口 `U` → 写参数页 `upgrade_req` → 复位回 Boot；Boot 窗口 3 s → 0.5 s，清一次性标志 + 30 s 超时回退不变砖
-- [ ] 第③步：串口升级通路（收固件 → W25Q `0x020000` 暂存 → CRC32 校验 → 擦写 APP → 复位）
+- [x] **第②步：升级请求（启动链路 11-14 真机通过；发 `U` 回 Boot 待验证）**：APP 串口 `U` → 写参数页 `upgrade_req` → 复位回 Boot；Boot 窗口 3 s → 0.5 s，清一次性标志 + 30 s 超时回退不变砖
+- [ ] 第③步：串口升级通路（收固件 → W25Q `0x020000` 暂存 → CRC32 校验 → 擦写 APP → 复位）；**长度必须由协议头给出，不能扫 0xFF**（见 11-14 日志）
 - [ ] 第④步：失败保护（`boot_try` 计数、APP 无效停 Boot、超限不跳转），故意传坏包验证不变砖
 
 ## 说明
