@@ -243,7 +243,30 @@ jumping to app...
 
 已把日志措辞改成 `valid, scan_end=`，并在 `boot_jump.c` 里写明限制。**对第③步的硬约束**：CRC32 校验范围、擦除页数、从 W25Q 复制多少字节，都必须由上位机协议头里的 `length` 决定（或写进 W25Q 暂存区的固件头），**绝不能靠扫描 0xFF 推断长度** —— 否则会把残留垃圾一起算进去，校验永远对不上。
 
-**尚未验证**：上面两轮都是 `upgrade_req=0` → `jumping to app...`，只跑了正常启动；**APP 运行时发 `U` 回到 Boot** 这条链路还没测。
+**验证 2 同日 16:54 也已通过。** APP 运行时串口发单个字符 `u`（SSCOM 勾了「加回车换行」，状态栏 `S:3` 说明实际发出 `u\r\n` 共 3 字节），抓到的关键信号：
+
+```
+[OTA] upgrade requested -> reboot to BootLoader
+===== OTA BootLoader v0.1 =====
+param: ok, upgrade_req=1, boot_try=0
+...
+upgrade_req found -> stay in boot
+waiting for firmware 30000 ms...
+timeout -> fallback to app
+jumping to app...
+```
+
+| 信号 | 证明 |
+|---|---|
+| `[OTA] upgrade requested` | APP 的 USART1 RXNE 中断收到命令；代码等 `TC` 标志把提示发完才复位，这行不会缺字 |
+| `param: ok, upgrade_req=1` | 参数页写入成功、magic + CRC 合法，**标志跨复位活了下来**（`fresh` → `ok`） |
+| `upgrade_req found -> stay in boot` | Boot 读到标志、清 0 写回、进入升级等待 |
+| `waiting for firmware 30000 ms...` | 30 s 窗口生效；PC13 2 Hz 慢闪、屏幕全黑（Boot 不驱动屏） |
+| `timeout -> fallback to app` + `jumping to app...` | 请求了但没接上位机也能自己回 APP，**误触发不变砖** |
+
+发小写 `u` 也能命中：`BOOT_CMD_CHAR` 是 `'U'`，Boot 与 APP 两处判断都同时接受 `'U' + 0x20`。这一轮日志里的 `size=` 仍是旧措辞，因为烧的还是上一版 Boot —— 上面 `scan_end` 的改动只是注释 / 文案，不影响功能，不用专门重烧。
+
+**再按一次 RESET 可以做第三个确认**：参数页应显示 `param: ok, upgrade_req=0`（`ok` 而非 `fresh`），证明那个一次性标志确实被 Boot 清掉了，下次开机不会又白等 30 秒。
 
 ## 目录结构
 
@@ -416,6 +439,19 @@ Boot 只链了 HAL 的 GPIO / RCC / FLASH / PWR / CORTEX 五类模块，没链 U
 >
 > 两段 GIF 循环播放，单文件 2.96 MB / 4.61 MB；原始 mp4 未在仓库中重复存放。
 
+### OTA 两级启动与升级请求（2026-11-14）
+
+| 验证项 | 结果 |
+|---|---|
+| 上电 → Boot 500 ms 窗口 → 跳 APP，约 0.5 s 屏亮 | 通过 |
+| 串口 `waiting 500 ms ('U' to upgrade)...` + `jumping to app...` | 通过 |
+| APP 运行时发 `u` → 打印 `[OTA] upgrade requested` 并复位 | 通过 |
+| Boot 读到 `param: ok, upgrade_req=1` → `upgrade_req found -> stay in boot` | 通过 |
+| 30 s 升级等待 → `timeout -> fallback to app` → 天气时钟恢复 | 通过，不变砖 |
+| PC13 2 Hz 慢闪、屏幕全黑（Boot 不驱动屏） | 符合预期 |
+
+详细日志与 `size=47352` 的解析见前文「11-14 真机串口日志与一个已知陷阱」。
+
 ## 当前进度与后续计划
 
 - [x] 裸机版 → FreeRTOS 重构，Keil 编译 0 Error / 0 Warning
@@ -423,7 +459,7 @@ Boot 只链了 HAL 的 GPIO / RCC / FLASH / PWR / CORTEX 五类模块，没链 U
 - [x] **多任务重构**：`ui_task` / `net_task` / `heartbeat_task` + 队列 / 互斥量 / 二值信号量 / 栈水位监控，真机验证通过
 - [x] **图标外置到 W25Q**：27 KB 图标移出片内 Flash，固件 48 232 B → 21 128 B，`ICON OK 27648B` 逐字节校验通过
 - [x] **BootLoader 骨架（第①步）**：`boot/` + `mdk_boot/` 独立工程，16 KB 分区、参数页、MSP/PC 校验、3 秒窗口、VTOR 跳转；APP 已迁到 `0x08004000`，真机两级启动通过
-- [x] **第②步：升级请求（启动链路 11-14 真机通过；发 `U` 回 Boot 待验证）**：APP 串口 `U` → 写参数页 `upgrade_req` → 复位回 Boot；Boot 窗口 3 s → 0.5 s，清一次性标志 + 30 s 超时回退不变砖
+- [x] **第②步：升级请求（11-14 真机全链路通过）**：APP 串口 `U` → 写参数页 `upgrade_req` → 复位回 Boot；Boot 窗口 3 s → 0.5 s，清一次性标志 + 30 s 超时回退不变砖
 - [ ] 第③步：串口升级通路（收固件 → W25Q `0x020000` 暂存 → CRC32 校验 → 擦写 APP → 复位）；**长度必须由协议头给出，不能扫 0xFF**（见 11-14 日志）
 - [ ] 第④步：失败保护（`boot_try` 计数、APP 无效停 Boot、超限不跳转），故意传坏包验证不变砖
 
