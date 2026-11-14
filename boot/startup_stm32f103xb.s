@@ -29,7 +29,10 @@
 ;   <o> Stack Size (in Bytes) <0x0-0xFFFFFFFF:8>
 ; </h>
 
-Stack_Size		EQU     0x400
+; 第③步把栈从 1 KB 加到 2 KB：升级状态机里有 256 B 的读缓冲、
+; 136 B 的帧结构，再叠加 HAL_FLASHEx_Erase 的调用栈，1 KB 有点紧。
+; Boot 的 RAM 总共才用 2 KB 左右，20 KB SRAM 完全负担得起。
+Stack_Size		EQU     0x800
 
                 AREA    STACK, NOINIT, READWRITE, ALIGN=3
 Stack_Mem       SPACE   Stack_Size

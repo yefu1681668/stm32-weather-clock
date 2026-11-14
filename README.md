@@ -167,7 +167,7 @@ net_task:  xSemaphoreTake(g_lcd_ready)         屏没初始化好之前绝不碰
 
 | 区域 | 起始地址 | 大小 | 当前占用 |
 |---|---|---|---|
-| Boot | `0x08000000` | 16 KB | 5 364 B（32.7%） |
+| Boot | `0x08000000` | 16 KB | 8 128 B（49.6%） |
 | APP | `0x08004000` | 47 KB（`0xBC00`） | 22 564 B（46.9%） |
 | 参数页 | `0x0800FC00` | 1 KB | 升级标志 / `boot_try` 计数 |
 
@@ -175,16 +175,16 @@ Boot 主流程：`HAL_Init` → 时钟（HSE 起不来就 10 Hz 快闪报错，�
 
 跳转做了三件容易被忽略的事：`__disable_irq()`、`SCB->VTOR = APP 地址`、`__set_MSP(APP 栈顶)` 之后才 `((void(*)(void))复位向量)()`。APP 侧 `main()` 开头也重设一次 `VTOR`，这样 APP 单独烧到 `0x08000000` 调试时行为不变。
 
-**Boot 故意不驱动屏幕。** 它只有 5 KB，没有 ST7735 驱动，也不碰 PB10（背光）；`st7735_bl_on()` 是 APP 的 `st7735_init()` 最后一句。所以**只烧 Boot、或 APP 区还没有有效固件时，上电屏幕是全黑而不是白屏** —— 这是设计而非故障，此时唯一的指示是 PC13：
+**Boot 故意不驱动屏幕。** 它只有 8 KB，没有 ST7735 驱动，也不碰 PB10（背光）；`st7735_bl_on()` 是 APP 的 `st7735_init()` 最后一句。所以**只烧 Boot、或 APP 区还没有有效固件时，上电屏幕是全黑而不是白屏** —— 这是设计而非故障，此时唯一的指示是 PC13：
 
 | PC13 表现 | 含义 |
 |---|---|
 | 5 Hz 快闪 0.5 秒后转为 APP 的 1 Hz | 正常：Boot 跑通并跳转成功 |
-| 2 Hz 慢闪最长 30 秒，之后跳 APP | 已进入升级等待窗口 |
-| 一直 5 Hz 慢闪不停 | APP 校验不过（没烧、或没烧到 `0x08004000`） |
+| 2 Hz 慢闪 | 在升级窗口里等上位机 / 正在收固件 |
+| 一直 5 Hz 慢闪不停 | APP 校验不过（没烧、或没烧到 `0x08004000`）；发 `U` 可重新升级救砖 |
 | 10 Hz 快闪 | 时钟起不来（HSE 异常） |
 
-接 CH340 到 PA9/PA10（115200）可以看到 Boot 日志：版本、参数状态、APP 地址与有效长度、`jumping to app...`。Boot 用寄存器直接操作 USART1（约 20 行），因为本工程 HAL 的 UART 模块是关着的 —— 这样做也省了 1~2 KB ROM。
+接 CH340 到 PA9/PA10（115200）可以看到 Boot 日志：版本、参数状态、APP 地址与有效长度、`jumping to app...`。Boot 用寄存器直接操作 USART1（`boot/boot_uart.c`），因为本工程 HAL 的 UART 模块是关着的 —— 这样做也省了 1~2 KB ROM。
 
 > 第①步最初是固定等 3 秒，每次开机都白等；第②步改成 500 ms 按需等待，详见下节。
 
@@ -204,7 +204,7 @@ Boot 主流程：`HAL_Init` → 时钟（HSE 起不来就 10 Hz 快闪报错，�
 
 **标志是一次性的**：Boot 一读到 `upgrade_req=1` 就立刻清 0 写回，再进入等待。不清的话升级结束后每次复位都会再停一次，板子就永远回不了 APP。清失败时**直接忽略这次请求**（宁可丢一次升级，也不让每次开机白等 30 秒）。正常开机绝不擦写参数页，避免磨损 Flash。
 
-**超时回退**：`BOOT_UPGRADE_WAIT_MS = 30 s`，第③步的固件接收流程会占掉这个窗口；现在先做"等不到就跳回 APP"，保证误触发一次也不会变砖。
+**超时回退**：`BOOT_UPGRADE_WAIT_MS = 30 s` 是「等第一个字节」的窗口；第③步已把它换成真正的固件接收状态机，30 s 内没等到上位机就 `timeout -> fallback to app`，误触发一次也不会变砖。
 
 | 常量 | 值 | 位置 |
 |---|---|---|
@@ -219,7 +219,7 @@ Boot 主流程：`HAL_Init` → 时钟（HSE 起不来就 10 Hz 快闪报错，�
 1. 两个 hex 都重烧，正常上电 → **约 0.5 秒**后屏亮（原来 3 秒），串口打印 `waiting 500 ms ('U' to upgrade)...` 后 `jumping to app...`。
 2. 天气时钟跑起来后，串口助手发送一个字符 `U` → APP 打印 `[OTA] upgrade requested -> reboot to BootLoader` 并立刻复位。
 3. Boot 打印 `upgrade_req found -> stay in boot`、`waiting for firmware 30000 ms...`，PC13 改为 **2 Hz 慢闪**，屏幕保持全黑（Boot 不驱动屏）。
-4. 30 秒后打印 `timeout -> fallback to app` → 跳回天气时钟，界面恢复正常。
+4. 第②步当时是「30 秒后 `timeout -> fallback to app` 跳回天气时钟」；第③步之后这个窗口会被固件接收状态机接管，没接上位机时才走同样的超时回退。
 
 > 没接 CH340 也能验证第 1 条：上电到屏亮明显变快，就说明 500 ms 窗口生效了。
 
@@ -268,6 +268,75 @@ jumping to app...
 
 **再按一次 RESET 可以做第三个确认**：参数页应显示 `param: ok, upgrade_req=0`（`ok` 而非 `fresh`），证明那个一次性标志确实被 Boot 清掉了，下次开机不会又白等 30 秒。
 
+### OTA BootLoader 第三步：串口固件升级（2026-11-14）
+
+第②步那个 30 秒窗口只是空等，这一步把它换成真正的升级状态机：**串口收固件 → W25Q 暂存 → CRC32 校验 → 擦写 APP 区 → 复位**。
+
+**为什么必须经过 W25Q**：C8T6 只有 20 KB SRAM，而一版 APP 固件 22 564 B，根本不可能整包收进 RAM。所以每收到一帧就立刻顺序写进外部 Flash，收完再从 W25Q 流式读回来算 CRC32。这个约束反而带来一个关键安全性质 —— **CRC32 通过之前，APP 区一个字节都不会被擦**：传坏包、断线、中途断电，板子都还留着原来能跑的固件。
+
+**镜像布局**（W25Q `0x020000` 起，与图标区 `0x010000` 隔着 64 KB）
+
+| 偏移 | 大小 | 内容 |
+|---|---|---|
+| `+0x00` | 32 B | 镜像头：`magic "OTA2"` / `length` / `crc32` / `version` / 保留 |
+| `+0x20` | N B | 固件原始数据（从 `0x08004000` 起的连续映像） |
+
+`length` 只能来自这个头（上位机解析 Intel HEX 时按「最后一个写过的地址」计算），**绝不靠扫 0xFF 推断** —— 这正是 11-14 日志里 `size=47352` 那个坑。
+
+**串口分帧**（115200 8N1）
+
+```
+SOF 0xA5 | TYPE 1B | SEQ 2B(小端) | LEN 2B(小端) | PAYLOAD <=128B | CRC16 2B(小端)
+```
+
+| TYPE | PAYLOAD | Boot 的动作 |
+|---|---|---|
+| `0x01` HEAD | 32 B | 校验 magic / length → 擦暂存扇区 → 把头写进 W25Q |
+| `0x02` DATA | ≤128 B | 顺序写 W25Q `+0x20+offset`，回 ACK |
+| `0x03` END | 0 B | 校验字节数收齐后进入提交流程 |
+
+应答是单字节：`0x06` ACK / `0x15` NAK（重发本帧）/ `0x07` DONE（成功，即将复位）/ `0x1B` ABORT。CRC16-CCITT-FALSE（poly `0x1021`，init `0xFFFF`）覆盖 `TYPE..PAYLOAD`，不含 SOF；**整包完整性由 CRC32 负责**。上位机最多重发 3 次，Boot 遇到「重复上一帧」直接回 ACK，能容忍 ACK 丢失。
+
+**为什么帧内绝不 `HAL_Delay`**：F1 的 USART 没有 FIFO，RXNE 只锁存 1 个字节，115200 下每 86.8 µs 就来一个。收帧途中插 10 ms 延时会把后面整帧丢光，所以从 SOF 开始的每个字节都是紧轮询读取，只有「还没进帧、在等 SOF」时才闪 LED。上位机也严格逐帧等 ACK，绝不连发。
+
+**提交流程**（`boot/boot_ota.c` 的 `ota_commit()`）
+
+1. 从 W25Q `+0x20` 起按 256 B 分块流式读，累加 CRC32，与镜像头比对。不符 → 打印 `CRC MISMATCH` 直接返回，**APP 区未动**。
+2. `boot_flash_erase_range(APP_START_ADDR, APP_MAX_SIZE)` 擦**整个** APP 区 47 页，而不是只擦 `length` 覆盖的页 —— 顺带清掉迁址前那版 48 KB 旧固件的残骸，所以升级后开机日志的 `scan_end` 会从 47352 变成真实的 22564。
+3. 从 W25Q 逐块读、按半字写回内部 Flash。
+4. 内部 Flash 是内存映射的，直接按地址读回来**再算一次 CRC32**，抓「`HAL_FLASH_Program` 返回 OK 但实际没写进去」。
+5. `boot_app_check()` 复核 MSP / PC → 参数页记 `app_size` / `app_crc32` / `boot_try=0` → 回 DONE → `NVIC_SystemReset()`。
+
+**救砖入口**：万一擦写中途失败导致 APP 无效，Boot 会停在 5 Hz 慢闪；此时串口发一个 `U` 就能重进升级状态机再传一次，不需要 ST-Link。
+
+| 文件 | 作用 |
+|---|---|
+| `boot/boot_ota.c/.h` | 分帧状态机、CRC16、W25Q 暂存、提交流程 |
+| `boot/boot_uart.c/.h` | 从 `boot_main.c` 抽出的 USART1 底层，新增带超时的阻塞读 |
+| `boot/delay.c/.h` | 让 `mdk/driver/w25q/w25q.c` **一行不改**就能被 Boot 复用（`delay_ms` → `HAL_Delay`） |
+| `boot/boot_main.c` | 30 s 空等换成 `boot_ota_run()`；末尾 `while(1)` 加救砖入口 |
+| `boot/boot_cfg.h` | 协议常量、`OTA_STAGING_ADDR 0x020000`、版本 v0.2 |
+| `boot/startup_stm32f103xb.s` | 栈 1 KB → 2 KB（256 B 读缓冲 + 136 B 帧结构 + HAL 擦写调用栈） |
+| `mdk_boot/BootLoader.uvprojx` | 新增 `W25Q (shared with APP)` 分组，直接引用 `..\mdk\driver\w25q\w25q.c` |
+
+**上位机**：`tools/ota_send.py` + `tools/ota_uart.py`。本机 pip 装不上 pyserial，所以串口层用 `ctypes` 直接调 Windows `kernel32`（`CreateFileW` / `SetCommState` / `ReadFile` / `WriteFile`），**零第三方依赖**。脚本负责解析 Keil 的 Intel HEX、加镜像头、发 `U` 触发、逐帧等 ACK，并实时把 Boot 日志打印出来 —— 应答是控制码（`0x06`/`0x15`/`0x07`/`0x1B`），日志全是可打印 ASCII，两者不会混淆。
+
+```bash
+python tools/ota_send.py --port COM14
+python tools/ota_send.py --port COM14 --hex mdk/Objects/Freertos的嵌入式智能天气时钟.hex
+```
+
+默认升级包就是**当前这份 APP 的 hex 还原出来的 bin**（22 564 B / 177 帧 / CRC32 `0xC05D9226`）。功能不变，但完整验证了「擦 → 写 → 读回校验 → 复位 → 跳转」整条链，而且 `scan_end` 的变化是肉眼可见的证据。
+
+**验证方法（代码完成，真机验证待补）**
+
+1. 只重烧 **Boot v0.2**（`mdk_boot`，`F7` → `F8`，Erase Sectors）；APP 源码与 hex **逐字节未变，不用重烧**。
+2. 关掉串口助手，接好 CH340（TX→PA10 / RX→PA9 / 共地），运行 `python tools/ota_send.py --port COM14`。
+3. 期望日志：`[OTA] W25Q id=0x00EF4014` → `[OTA] HEAD len=22564` → 每 4 KB 一条 `recv ...` → `[OTA] crc32 ok, erasing APP 47 KB...` → `[OTA] write 22564 B, readback crc ok` → `[OTA] DONE, resetting...`。
+4. 复位后：`===== OTA BootLoader v0.2 =====`、`app @0x08004000 valid, scan_end=22564`（不再是 47352）、`jumping to app...`，天气时钟界面正常。
+
+> 尚未验证：坏包 / 断电时「APP 区不被动」这条安全性，以及第④步的 `boot_try` 失败保护。
+
 ## 目录结构
 
 ```
@@ -281,19 +350,26 @@ weather_clock/
 │   ├── hardware.jpg / screen.jpg
 │   └── demo-offline.gif / demo-online.gif
 ├── boot/                    OTA BootLoader 源码（编到 0x08000000，16 KB 分区）
-│   ├── boot_main.c          主流程：时钟 → 参数 → 500 ms 窗口 → 升级等待/跳转
+│   ├── boot_main.c          主流程：时钟 → 参数 → 500 ms 窗口 → 升级状态机/跳转
 │   ├── boot_jump.c          MSP/PC 合法性检查 + 关中断 + 设 VTOR + 跳转
 │   ├── boot_flash.c         内部 Flash 擦写 + APP 有效长度测量
 │   ├── boot_param.c         参数页（0x0800FC00）读写
-│   └── boot_crc.c           CRC32（poly 0xEDB88320，表驱动）
+│   ├── boot_crc.c           CRC32（poly 0xEDB88320，位运算版省 ROM）
+│   ├── boot_ota.c           第③步：分帧接收 / W25Q 暂存 / 校验 / 擦写 APP
+│   ├── boot_uart.c          USART1 寄存器直写（日志 + 带超时收字节）
+│   ├── delay.c              Boot 侧延时适配层，复用 APP 的 w25q.c
+│   └── startup_stm32f103xb.s  Boot 专用启动文件（栈 2 KB）
 ├── mdk/                     Keil MDK 工程（APP）
 │   ├── Freertos的嵌入式智能天气时钟.uvprojx
 │   ├── app/                 应用层：天气解析、字库、开机动画、图标布局、app_upgrade.c
 │   ├── driver/              外设驱动：st7735 / esp-at / mpu6050 / w25q / led / rtc
 │   ├── user/                任务实现 freertos_demo.c、本地配置 wifi_config.h
 │   └── Boot/Shared 分组     复用 ../boot 的参数页代码（同一份结构体与 CRC）
-└── mdk_boot/                Keil MDK 工程（Boot，独立工程）
-    └── BootLoader.uvprojx
+├── mdk_boot/                Keil MDK 工程（Boot，独立工程）
+│   └── BootLoader.uvprojx   含 W25Q (shared with APP) 分组
+└── tools/                   OTA 上位机（零第三方依赖）
+    ├── ota_send.py          解析 hex / 加镜像头 / 分帧发送 / 打印 Boot 日志
+    └── ota_uart.py          ctypes 调 Windows kernel32 的串口层
 ```
 
 工程文件使用 `..\Core`、`..\Drivers`、`..\FreeRTOS` 相对路径引用上层目录，因此**必须保持上述目录结构**，不可只复制 `mdk/`。
@@ -315,7 +391,21 @@ weather_clock/
    - Boot：`mdk_boot/BootLoader.uvprojx`，IROM 起始 `0x08000000`，大小 `0x4000`
    - APP：`mdk/Freertos的嵌入式智能天气时钟.uvprojx`，IROM 起始 `0x08004000`，大小 `0xBC00`
 3. **编译烧录**：`F7` 编译 → `F8` 下载（ST-Link，BOOT0 接 GND）。**两个都必须烧**，只烧 Boot 屏幕不会亮（Boot 不驱动屏幕，详见下节）。首次打开 Boot 工程如果弹 `No ULINK2/ME Device found`，是调试器默认选中了 ULINK2，在 `Options for Target → Debug → Use:` 里改成 `ST-Link Debugger` 即可。
-4. **上电观察**：PC13 快闪约 3 秒（Boot 窗口）→ 屏幕亮起、中间提示行依次走 `1/4 Init ESP...` → `2/4 STA Mode...` → `3/4 <SSID>...` → `4/4 SNTP Sync...` → 进入时钟界面，LED 转为稳定 1 Hz 慢闪
+4. **上电观察**：PC13 快闪约 0.5 秒（Boot 500 ms 窗口）→ 屏幕亮起、中间提示行依次走 `1/4 Init ESP...` → `2/4 STA Mode...` → `3/4 <SSID>...` → `4/4 SNTP Sync...` → 进入时钟界面，LED 转为稳定 1 Hz 慢闪
+
+### 串口 OTA 升级（不用 ST-Link）
+
+第③步做完之后，改 APP 不必再动 ST-Link：Boot 自己收固件、自己擦写 APP 区。
+
+```bash
+# 1. 关掉串口助手（COM 口只能被一个程序占用）
+# 2. 确认 CH340：TXD->PA10、RXD->PA9、GND 共地
+python tools/ota_send.py --port COM14
+```
+
+脚本会自动解析 `mdk/Objects/Freertos的嵌入式智能天气时钟.hex`、加 32 B 镜像头、发 `U` 让板子回 Boot、逐帧发送并实时打印 Boot 日志。**零第三方依赖**（串口层用 `ctypes` 调 Windows 系统 API）。
+
+> Boot 只在改 `boot/` 目录时才需要用 ST-Link 重烧；日常改天气时钟只要编译 APP 生成新 hex，再跑一次上面的命令即可。协议细节与验证清单见「OTA BootLoader 第三步」。
 
 ### 排障提示（都是真机踩过的坑）
 
@@ -350,17 +440,17 @@ Program Size: Code=17948  RO-data=4356  RW-data=260  ZI-data=17812
 **Boot 侧（`mdk_boot/BootLoader.uvprojx`）**
 
 ```
-Program Size: Code=5024  RO-data=320  RW-data=20  ZI-data=1092
+Program Size: Code=7788  RO-data=320  RW-data=20  ZI-data=2116
 ```
 
 | 项目 | 占用 | 总容量 | 使用率 |
 |---|---|---|---|
-| Boot Flash | 5 364 B | 16 KB | 32.7% |
-| Boot RAM | 1 112 B | 20 KB | 5.4% |
+| Boot Flash | 8 128 B | 16 KB | 49.6% |
+| Boot RAM | 2 136 B | 20 KB | 10.4% |
 
-Boot 只链了 HAL 的 GPIO / RCC / FLASH / PWR / CORTEX 五类模块，没链 UART（串口用寄存器写）、没链屏驱动、没链 FreeRTOS，所以 5 KB 就够，16 KB 里还剩约 11 KB 留给第③步的固件接收流程。
+Boot 只链了 HAL 的 GPIO / RCC / FLASH / PWR / CORTEX 五类模块，没链 UART（串口用寄存器写）、没链屏驱动、没链 FreeRTOS。第③步把分帧状态机 + 软件 SPI Flash 驱动加进来后是 8 KB，16 KB 里还剩约 8 KB。RAM 2 136 B 里有一半是 2 KB 栈（第③步从 1 KB 调上来的），实测量足够。
 
-**图标外置前后的体积账**（下表是 11-11 图标外置完成时的快照，之后第②步又加了约 1.4 KB）
+**图标外置前后的体积账**（下表是 11-11 图标外置完成时的快照，之后第②步又加了约 1.4 KB；第③步只改 Boot，APP 侧 22 564 B 逐字节未变）
 
 | | Flash | RO-data | RAM |
 |---|---|---|---|
@@ -460,7 +550,7 @@ Boot 只链了 HAL 的 GPIO / RCC / FLASH / PWR / CORTEX 五类模块，没链 U
 - [x] **图标外置到 W25Q**：27 KB 图标移出片内 Flash，固件 48 232 B → 21 128 B，`ICON OK 27648B` 逐字节校验通过
 - [x] **BootLoader 骨架（第①步）**：`boot/` + `mdk_boot/` 独立工程，16 KB 分区、参数页、MSP/PC 校验、3 秒窗口、VTOR 跳转；APP 已迁到 `0x08004000`，真机两级启动通过
 - [x] **第②步：升级请求（11-14 真机全链路通过）**：APP 串口 `U` → 写参数页 `upgrade_req` → 复位回 Boot；Boot 窗口 3 s → 0.5 s，清一次性标志 + 30 s 超时回退不变砖
-- [ ] 第③步：串口升级通路（收固件 → W25Q `0x020000` 暂存 → CRC32 校验 → 擦写 APP → 复位）；**长度必须由协议头给出，不能扫 0xFF**（见 11-14 日志）
+- [x] **第③步：串口固件升级（代码完成，真机验证待补）**：`tools/ota_send.py` 分帧发 bin → Boot 写 W25Q `0x020000` 暂存 → CRC32 → 擦整个 APP 区 → 写回 + 读回校验 → 复位；长度由镜像头给出、不扫 0xFF，CRC 通过前 APP 区不被动，另留了发 `U` 救砖入口
 - [ ] 第④步：失败保护（`boot_try` 计数、APP 无效停 Boot、超限不跳转），故意传坏包验证不变砖
 
 ## 说明

@@ -35,6 +35,8 @@ EventRecorderStub.scvd
 .idea/
 Thumbs.db
 .DS_Store
+__pycache__/
+*.pyc
 
 # ---------- 说明 ----------
 # mdk/user/wifi_config.h 故意不在此忽略：

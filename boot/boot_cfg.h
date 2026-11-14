@@ -17,7 +17,7 @@
  *   0x020000  升级固件暂存区（Boot 先写这里，校验通过才搬进 APP 区）
  * ================================================================== */
 
-#define BOOT_VERSION_STR      "0.1"
+#define BOOT_VERSION_STR      "0.2"
 
 #define FLASH_BASE_ADDR       0x08000000UL
 #define BOOT_MAX_SIZE         0x4000UL          /* 16 KB，Boot 自己绝不能超 */
@@ -43,5 +43,45 @@
 /* 手动进入升级的单字符命令。Boot 窗口和 APP 运行时都认它，
  * 这样即使 APP 坏了、跑不起来，也能在复位瞬间从 Boot 手动进升级。 */
 #define BOOT_CMD_CHAR         'U'
+
+/* ==================================================================
+ * 第③步：串口升级协议（OTA v1）
+ *
+ * 为什么必须走 W25Q 暂存：C8T6 只有 20 KB SRAM，而 APP 固件 22 564 B，
+ * 根本不可能整包收进 RAM 再校验。所以每收一帧就顺序写进外部 Flash，
+ * 收完再从 W25Q 流式读回来算 CRC32，通过了才敢擦 APP 区。
+ *
+ * W25Q 暂存区里的「镜像」布局（起点 0x020000）：
+ *   +0x00  32 B  镜像头：magic / length / crc32 / version / 保留
+ *   +0x20  N B   固件原始数据（从 0x08004000 开始的连续映像）
+ *
+ * 串口分帧（115200 8N1）：
+ *   SOF 1B(0xA5) | TYPE 1B | SEQ 2B(小端) | LEN 2B(小端)
+ *   | PAYLOAD LEN B | CRC16 2B(小端, 覆盖 TYPE..PAYLOAD)
+ *   TYPE: 0x01=HEAD(payload 32B) 0x02=DATA(<=128B) 0x03=END(0B)
+ *   应答: 0x06=ACK  0x15=NAK(重发本帧)  0x07=DONE(成功待复位)  0x1B=ABORT
+ *
+ * 【硬约束】length 只能来自镜像头，绝不能靠扫 0xFF 推断 ——
+ * APP 区后半段残留着迁址前的旧固件，扫出来的长度是假的（见 11-14 日志）。
+ * ================================================================== */
+
+/* 与 mdk/app/icons_flash.h 的 W25Q_FW_BASE 必须是同一个地址 */
+#define OTA_STAGING_ADDR      0x020000UL
+#define OTA_IMAGE_HDR_SIZE    32UL
+#define OTA_IMAGE_MAGIC       0x3241544FUL      /* "OTA2" 按小端读成 uint32 */
+
+#define OTA_FRAME_SOF         0xA5u
+#define OTA_TYPE_HEAD         0x01u
+#define OTA_TYPE_DATA         0x02u
+#define OTA_TYPE_END          0x03u
+#define OTA_PAYLOAD_MAX       128u
+
+#define OTA_ACK               0x06u
+#define OTA_NAK               0x15u
+#define OTA_DONE              0x07u
+#define OTA_ABORT             0x1Bu
+
+#define OTA_BYTE_TIMEOUT_MS   500UL             /* 一帧内部字节间最大间隔 */
+#define OTA_FIRST_FRAME_MS    BOOT_UPGRADE_WAIT_MS  /* 等第一个 SOF 的时间 */
 
 #endif /* __BOOT_CFG_H__ */

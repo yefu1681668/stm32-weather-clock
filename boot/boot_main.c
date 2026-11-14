@@ -1,19 +1,20 @@
 /**
  ******************************************************************************
  * @file    boot_main.c
- * @brief   OTA BootLoader 主程序（第②步：按需等待 + 升级请求）
+ * @brief   OTA BootLoader 主程序（第③步：串口固件升级）
  *
  * 上电后的完整动作：
  *   初始化时钟/串口/LED → 读参数页 → 检查 APP 是否可跳
  *   → 500 ms 常规窗口（LED 5 Hz 快闪，期间串口发 'U' 可手动请求升级）
- *   → 若参数页有升级请求 / 收到命令：立刻清标志，进入 30 s 升级等待
- *   → 等不到就回退跳 APP，绝不因为一次误触发把板子卡死
+ *   → 若参数页有升级请求 / 收到命令：立刻清标志，进入串口升级状态机
+ *     （HEAD/DATA/END 分帧 -> W25Q 暂存 -> CRC32 -> 擦写 APP -> 复位）
+ *   → 传坏包或 30 s 没等到上位机，APP 区一个字节都不擦，照常跳回 APP
  *
  * LED 语言（不用接串口也能判断状态）：
  *   5 Hz 快闪 0.5 s 后跳走  = 正常启动
  *   2 Hz 慢闪最长 30 s      = 已进入升级等待
  *   10 Hz 快闪不停          = HSE 时钟起不来
- *   5 Hz 慢闪不停           = APP 无效 / 校验不通过，停在 Boot
+ *   5 Hz 慢闪不停           = APP 无效 / 校验不通过，停在 Boot（发 U 可救砖）
  *
  * 烧录设置（务必确认，否则会把自己锁死）：
  *   IROM1 起始 0x08000000，大小 0x4000（16 KB）
@@ -23,117 +24,11 @@
 #include "boot_cfg.h"
 #include "boot_param.h"
 #include "boot_jump.h"
+#include "boot_uart.h"
+#include "boot_ota.h"
 #include "stm32f1xx_hal.h"
-#include <string.h>
 
 static boot_param_t g_param;
-
-/* ---------------- 串口日志（直接操作 USART1 寄存器） ----------------
- * 为什么不用 HAL_UART：这个工程（和 APP 一样）没有打开 HAL_UART 模块，
- * Boot 只需要"发几个字符"，用寄存器 20 行就够了，还能省 1~2 KB ROM。 */
-static void boot_uart_init(void)
-{
-    GPIO_InitTypeDef gpio = {0};
-
-    __HAL_RCC_GPIOA_CLK_ENABLE();
-    __HAL_RCC_USART1_CLK_ENABLE();
-
-    gpio.Pin   = GPIO_PIN_9;                /* TX */
-    gpio.Mode  = GPIO_MODE_AF_PP;
-    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
-    HAL_GPIO_Init(GPIOA, &gpio);
-
-    gpio.Pin  = GPIO_PIN_10;                /* RX（第③步收固件要用） */
-    gpio.Mode = GPIO_MODE_INPUT;
-    gpio.Pull = GPIO_PULLUP;
-    HAL_GPIO_Init(GPIOA, &gpio);
-
-    /* 72 MHz / 115200 / 16 倍采样 = 39.0625 → BRR = 0x271 */
-    USART1->BRR = 0x271;
-    USART1->CR2 = 0;
-    USART1->CR3 = 0;
-    USART1->CR1 = USART_CR1_UE | USART_CR1_TE | USART_CR1_RE;   /* 8N1 */
-
-    /* 清空复位前可能残留在接收寄存器里的字节。
-     * 从 APP 复位过来时，串口线上偶尔会挂着一个噪声字节；
-     * 不清的话 500 ms 窗口里可能被误读成升级命令。 */
-    (void)USART1->SR;
-    (void)USART1->DR;
-}
-
-static void boot_uart_send(const char *s, uint16_t len)
-{
-    uint32_t guard;
-
-    for (uint16_t i = 0; i < len; i++)
-    {
-        guard = 100000;
-        while ((USART1->SR & USART_SR_TXE) == 0)
-        {
-            if (--guard == 0)
-                return;                     /* 串口异常也不能把 Boot 卡死 */
-        }
-        USART1->DR = (uint8_t)s[i];
-    }
-
-    guard = 100000;
-    while ((USART1->SR & USART_SR_TC) == 0)
-    {
-        if (--guard == 0)
-            return;
-    }
-}
-
-static void boot_log(const char *s)
-{
-    boot_uart_send(s, (uint16_t)strlen(s));
-}
-
-static void boot_log_u32(uint32_t v)
-{
-    char buf[11];
-    int  i = 10;
-
-    buf[i--] = '\0';
-    if (v == 0)
-        buf[i--] = '0';
-    while (v > 0 && i >= 0)
-    {
-        buf[i--] = (char)('0' + (v % 10));
-        v /= 10;
-    }
-    boot_log(&buf[i + 1]);
-}
-
-static void boot_log_hex(uint32_t v)
-{
-    static const char hex[] = "0123456789ABCDEF";
-    char buf[11];
-    int  i;
-
-    buf[0] = '0';
-    buf[1] = 'x';
-    for (i = 0; i < 8; i++)
-        buf[2 + i] = hex[(v >> ((7 - i) * 4)) & 0x0F];
-    buf[10] = '\0';
-    boot_log(buf);
-}
-
-/** 非阻塞收一个字符：没有数据时立刻返回 -1，绝不等待。
- *
- *  为什么不用中断：Boot 里没有 RTOS，也没有中断向量重定位的负担，
- *  但第③步收固件时是"一次一包"的阻塞流程，用中断反而要做环形缓冲。
- *  这里只需要在等待窗口里轮询，10 ms 一次足够 —— RXNE 是一直锁存的，
- *  读 DR 之前不会丢，单字符命令不存在溢出问题。 */
-static int boot_uart_getchar(void)
-{
-    if ((USART1->SR & USART_SR_RXNE) == 0)
-        return -1;
-
-    /* 顺手把溢出/噪声错误标志清掉：先读 SR 再读 DR 是 F1 的规定顺序 */
-    (void)USART1->SR;
-    return (int)(USART1->DR & 0xFF);
-}
 
 /* ---------------- 板级初始化 ---------------- */
 
@@ -293,22 +188,11 @@ int main(void)
         HAL_Delay(10);
     }
 
-    /* 升级等待窗口。第③步会把这个循环换成"收固件 → 写 W25Q → CRC 校验"，
-     * 现在先做超时回退：请求了但没接上位机，也能自己回到 APP，不会变砖。 */
+    /* 升级等待窗口（第③步）：真正的固件接收状态机。
+     * 升级成功会直接 NVIC_SystemReset() 不返回；超时 / 坏包 / 中止返回 0，
+     * 此时 APP 区一个字节都没被擦过，主流程照常跳回原来的 APP。 */
     if (stay_for_upgrade)
-    {
-        boot_log("waiting for firmware ");
-        boot_log_u32(BOOT_UPGRADE_WAIT_MS);
-        boot_log(" ms...\r\n");
-
-        for (uint32_t elapsed = 0; elapsed < BOOT_UPGRADE_WAIT_MS; elapsed += 10)
-        {
-            if ((elapsed % 250) == 0)
-                boot_led_toggle();          /* 2 Hz 慢闪，和启动窗口区分开 */
-            HAL_Delay(10);
-        }
-        boot_log("timeout -> fallback to app\r\n");
-    }
+        boot_ota_run(&g_param);
 
     if (boot_app_check(APP_START_ADDR))
     {
@@ -322,9 +206,19 @@ int main(void)
         boot_log("no valid app -> stay in boot\r\n");
     }
 
+    /* 停在 Boot：5 Hz 慢闪。同时保留"救砖入口"——
+     * 万一第③步擦写 APP 中途失败，APP 无效、板子看似变砖，
+     * 串口发一个 'U' 就能重进升级状态机，再传一次固件即可恢复。 */
     while (1)
     {
         boot_led_toggle();
-        HAL_Delay(100);                      /* 停在 Boot：5 Hz 慢闪等升级 */
+        HAL_Delay(100);
+
+        int ch = boot_uart_getchar();
+        if (ch == BOOT_CMD_CHAR || ch == (BOOT_CMD_CHAR + 0x20))
+        {
+            boot_log("\r\nrecovery upgrade request\r\n");
+            boot_ota_run(&g_param);
+        }
     }
 }

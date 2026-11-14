@@ -37,7 +37,7 @@
           <bCustSvd>0</bCustSvd>
           <UseEnv>0</UseEnv>
           <BinPath></BinPath>
-          <IncludePath>..\Core\Inc;..\Drivers\STM32F1xx_HAL_Driver\Inc;..\Drivers\STM32F1xx_HAL_Driver\Inc\Legacy;..\Drivers\CMSIS\Device\ST\STM32F1xx\Include;..\Drivers\CMSIS\Include;..\boot</IncludePath>
+          <IncludePath>..\Core\Inc;..\Drivers\STM32F1xx_HAL_Driver\Inc;..\Drivers\STM32F1xx_HAL_Driver\Inc\Legacy;..\Drivers\CMSIS\Device\ST\STM32F1xx\Include;..\Drivers\CMSIS\Include;..\boot;..\mdk\driver\w25q</IncludePath>
           <LibPath></LibPath>
           <RegisterFilePath></RegisterFilePath>
           <DBRegisterFilePath></DBRegisterFilePath>
@@ -336,7 +336,7 @@
               <MiscControls></MiscControls>
               <Define>USE_HAL_DRIVER,STM32F103xE</Define>
               <Undefine></Undefine>
-              <IncludePath>..\Core\Inc;..\Drivers\STM32F1xx_HAL_Driver\Inc;..\Drivers\STM32F1xx_HAL_Driver\Inc\Legacy;..\Drivers\CMSIS\Device\ST\STM32F1xx\Include;..\Drivers\CMSIS\Include;..\boot</IncludePath>
+              <IncludePath>..\Core\Inc;..\Drivers\STM32F1xx_HAL_Driver\Inc;..\Drivers\STM32F1xx_HAL_Driver\Inc\Legacy;..\Drivers\CMSIS\Device\ST\STM32F1xx\Include;..\Drivers\CMSIS\Include;..\boot;..\mdk\driver\w25q</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -354,7 +354,7 @@
               <MiscControls></MiscControls>
               <Define></Define>
               <Undefine></Undefine>
-              <IncludePath>..\Core\Inc;..\Drivers\STM32F1xx_HAL_Driver\Inc;..\Drivers\STM32F1xx_HAL_Driver\Inc\Legacy;..\Drivers\CMSIS\Device\ST\STM32F1xx\Include;..\Drivers\CMSIS\Include;..\boot</IncludePath>
+              <IncludePath>..\Core\Inc;..\Drivers\STM32F1xx_HAL_Driver\Inc;..\Drivers\STM32F1xx_HAL_Driver\Inc\Legacy;..\Drivers\CMSIS\Device\ST\STM32F1xx\Include;..\Drivers\CMSIS\Include;..\boot;..\mdk\driver\w25q</IncludePath>
             </VariousControls>
           </Aads>
           <LDads>
@@ -404,6 +404,16 @@
               <FileName>boot_crc.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\boot\boot_crc.c</FilePath>
+            </File>
+            <File>
+              <FileName>boot_ota.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\boot\boot_ota.c</FilePath>
+            </File>
+            <File>
+              <FileName>boot_uart.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\boot\boot_uart.c</FilePath>
             </File>
           </Files>
         </Group>
@@ -474,6 +484,21 @@
               <FileName>startup_stm32f103xb.s</FileName>
               <FileType>2</FileType>
               <FilePath>..\boot\startup_stm32f103xb.s</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>W25Q (shared with APP)</GroupName>
+          <Files>
+            <File>
+              <FileName>w25q.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\mdk\driver\w25q\w25q.c</FilePath>
+            </File>
+            <File>
+              <FileName>delay.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\boot\delay.c</FilePath>
             </File>
           </Files>
         </Group>
