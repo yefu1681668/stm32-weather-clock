@@ -420,17 +420,17 @@ Boot v0.3 + 新 APP 一起重烧后，用 `tools/ota_send.py` 的故障注入开
 **操作顺序**（`D:\stm32_10.25\weather_clock`，先关掉串口助手）：
 
 ```bash
-python tools/ota_send.py --port COM14 --brick --yes      # ① 刷坏固件
+python tools/ota_send.py --port COM14 --brick --yes      # ① 刷坏固件（脚本结束后已自动复位一次）
 python tools/ota_send.py --port COM14 --monitor          # ② 接着跑（同一窗口即可，脚本已释放 COM 口）
 ```
 
-第 ② 步按三次 RESET，期望日志依次为：
+**试跑次数怎么数**：升级成功时账本写 `boot_try=1`；脚本末尾 `DONE, resetting...` 引发的自动复位就是第 1 次启动（`trial boot #2`，跳过去立刻死）。所以用户只需再按 **2 次 RESET**，第 3 次上电时 `boot_try` 已到上限：
 
-| 次数 | 期望日志 |
+| 启动 | 期望日志 |
 |---|---|
-| 1 | `param: ... boot_try=1` → `trial boot #2 (APP must confirm)` → `jumping to app...`（然后死，不再有输出） |
-| 2 | `param: ... boot_try=2` → `trial boot #3` → `jumping to app...` |
-| 3 | `boot_try >= 3 -> trial FAILED, stay in boot` → `no bootable app -> stay in boot` → `waiting for firmware 30000 ms...`，LED 5 Hz 慢闪不停 |
+| 自动复位（脚本 [5/5] 里能看到） | `param: ... boot_try=1` → `trial boot #2 (APP must confirm)` → `jumping to app...`（然后死，不再有输出） |
+| 按 RESET 第 1 次 | `param: ... boot_try=2` → `trial boot #3` → `jumping to app...` |
+| 按 RESET 第 2 次 | `boot_try >= 3 -> trial FAILED, stay in boot` → `no bootable app -> stay in boot` → `waiting for firmware 30000 ms...`，LED 5 Hz 慢闪不停 |
 
 **救砖**：在 ② 的窗口按 `Ctrl+C` 释放 COM 口，然后跑一次普通升级 `python tools/ota_send.py --port COM14`。`wait_prompt()` 会匹配到恢复窗口打印的 `waiting for firmware`，正常收 HEAD/DATA/END，写回好固件并回到天气时钟界面。日志应重新出现 `[OTA] boot confirmed (screen up)`。
 
@@ -693,7 +693,7 @@ Boot v0.3 + 带 `app_boot_confirm()` 的新 APP（22 800 B / 179 帧 / CRC32 `0x
 - [x] **第②步：升级请求（11-14 真机全链路通过）**：APP 串口 `U` → 写参数页 `upgrade_req` → 复位回 Boot；Boot 窗口 3 s → 0.5 s，清一次性标志 + 30 s 超时回退不变砖
 - [x] **第③步：串口固件升级（11-15 真机全链路通过）**：`tools/ota_send.py` 分帧发 bin → Boot 写 W25Q `0x020000` 暂存 → CRC32 → 擦整个 APP 区 → 写回 + 读回校验 → 复位；实测 177 帧 / 22 564 B / 5.2 s，`scan_end` 47352 → 22564，界面正常。长度由镜像头给出、不扫 0xFF，CRC 通过前 APP 区不被动，另留了发 `U` 救砖入口
 - [x] **第④步：失败保护（11-15 真机验证通过）**：`boot_try` 试跑确认 + 账本 CRC32 校验 + 擦 APP 前先记账 + 停 Boot 自动循环等重升；坏包 / 截断 / 恢复三轮故障注入实测通过，`trial boot #2` → `[OTA] boot confirmed` 闭环成立
-- [ ] **第⑤步破坏性测试（工具已备好，真机验证待补）**：`--brick` 刷跑不起来的固件、三次 RESET 验证 `boot_try >= 3` 自动停 Boot、再正常升级救砖；可选真断电（擦 APP 时按 RESET）
+- [ ] **第⑤步破坏性测试（工具已备好，真机验证待补）**：`--brick` 刷跑不起来的固件、再按 2 次 RESET（合计 3 次试跑）验证 `boot_try >= 3` 自动停 Boot、再正常升级救砖；可选真断电（擦 APP 时按 RESET）
 
 ## 说明
 
