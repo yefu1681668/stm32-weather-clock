@@ -4,7 +4,7 @@
 
 本项目为「裸机版天气时钟」的 FreeRTOS 重构版本，同时也是后续 **OTA 远程升级** 改造的起点。
 
-> **状态：全部功能与多任务架构均已在真机验证通过**（2026-11-10），详见文末「真机验证记录」与「演示：断网 A/B 对比」。
+> **状态：全部功能、多任务架构与串口 OTA 全链路均已在真机验证通过**（2026-11-10 ~ 11-15），详见文末「真机验证记录」与「演示：断网 A/B 对比」。
 
 ![实物接线：STM32F103C8T6 + ST7735 彩屏 + ESP32-C3 面包板系统](docs/hardware.jpg)
 
@@ -328,12 +328,24 @@ python tools/ota_send.py --port COM14 --hex mdk/Objects/Freertos的嵌入式智�
 
 默认升级包就是**当前这份 APP 的 hex 还原出来的 bin**（22 564 B / 177 帧 / CRC32 `0xC05D9226`）。功能不变，但完整验证了「擦 → 写 → 读回校验 → 复位 → 跳转」整条链，而且 `scan_end` 的变化是肉眼可见的证据。
 
-**验证方法（代码完成，真机验证待补）**
+**真机验证（2026-11-15 通过）**
 
 1. 只重烧 **Boot v0.2**（`mdk_boot`，`F7` → `F8`，Erase Sectors）；APP 源码与 hex **逐字节未变，不用重烧**。
-2. 关掉串口助手，接好 CH340（TX→PA10 / RX→PA9 / 共地），运行 `python tools/ota_send.py --port COM14`。
-3. 期望日志：`[OTA] W25Q id=0x00EF4014` → `[OTA] HEAD len=22564` → 每 4 KB 一条 `recv ...` → `[OTA] crc32 ok, erasing APP 47 KB...` → `[OTA] write 22564 B, readback crc ok` → `[OTA] DONE, resetting...`。
-4. 复位后：`===== OTA BootLoader v0.2 =====`、`app @0x08004000 valid, scan_end=22564`（不再是 47352）、`jumping to app...`，天气时钟界面正常。
+2. 关掉串口助手，接好 CH340（TX→PA10 / RX→PA9 / 共地），在仓库根目录 `D:\stm32_10.25\weather_clock` 执行 `python tools/ota_send.py --port COM14`。
+3. 实测：**177/177 帧、22 564/22 564 B，发送耗时 5.2 s**；随后 Boot 自己完成 CRC32 校验、擦写 APP 区并复位。
+
+```
+[OTA] crc32 ok, erasing APP 47 KB...
+[OTA] write 22564 B, readback crc ok
+[OTA] DONE, resetting...
+===== OTA BootLoader v0.2 =====
+param: ok, upgrade_req=0, boot_try=0
+app @0x08004000 valid, scan_end=22564
+waiting 500 ms ('U' to upgrade)...
+jumping to app...
+```
+
+`scan_end` 从 11-14 的 47352（APP 区残留旧固件）变成 **22564**，正好等于协议头里的 `length`，说明整个 APP 区确实被擦过、再按新固件长度写回；`upgrade_req=0` 说明一次性标志被正确清掉；`jumping to app...` 之后天气时钟界面正常亮起。至此 **「触发 → 分帧 → W25Q 暂存 → CRC32 → 擦 → 写 → 读回校验 → 复位 → 跳转」全链路真机跑通**，以后改 APP 只需编译出新 hex 再跑一次脚本，不必再动 ST-Link。
 
 > 尚未验证：坏包 / 断电时「APP 区不被动」这条安全性，以及第④步的 `boot_try` 失败保护。
 
@@ -542,6 +554,20 @@ Boot 只链了 HAL 的 GPIO / RCC / FLASH / PWR / CORTEX 五类模块，没链 U
 
 详细日志与 `size=47352` 的解析见前文「11-14 真机串口日志与一个已知陷阱」。
 
+### 串口 OTA 全链路（2026-11-15）
+
+| 验证项 | 结果 |
+|---|---|
+| `tools/ota_send.py` 解析 hex → 加 32 B 镜像头 → 分 177 帧发送 | 通过，22 564 B / 5.2 s，帧帧 ACK 无重发 |
+| Boot 逐帧写 W25Q `0x020000` 暂存、每 4 KB 打印一条 `recv` | 通过 |
+| `crc32 ok, erasing APP 47 KB...` → `write 22564 B, readback crc ok` | 通过 |
+| 复位后 `param: ok, upgrade_req=0, boot_try=0` | 通过，一次性标志已清 |
+| `app @0x08004000 valid, scan_end=22564`（原 47352） | 通过，APP 区确实擦净重写 |
+| `jumping to app...` 后天气时钟界面正常 | 通过，功能未受影响 |
+| ST-Link 全程未参与，仅串口 + CH340 完成升级 | 通过 |
+
+这也是第③步最关键的证据：**固件长度由协议头决定**，不再依赖扫描 `0xFF`，所以 `scan_end` 会跟着真实固件长度变化。
+
 ## 当前进度与后续计划
 
 - [x] 裸机版 → FreeRTOS 重构，Keil 编译 0 Error / 0 Warning
@@ -550,7 +576,7 @@ Boot 只链了 HAL 的 GPIO / RCC / FLASH / PWR / CORTEX 五类模块，没链 U
 - [x] **图标外置到 W25Q**：27 KB 图标移出片内 Flash，固件 48 232 B → 21 128 B，`ICON OK 27648B` 逐字节校验通过
 - [x] **BootLoader 骨架（第①步）**：`boot/` + `mdk_boot/` 独立工程，16 KB 分区、参数页、MSP/PC 校验、3 秒窗口、VTOR 跳转；APP 已迁到 `0x08004000`，真机两级启动通过
 - [x] **第②步：升级请求（11-14 真机全链路通过）**：APP 串口 `U` → 写参数页 `upgrade_req` → 复位回 Boot；Boot 窗口 3 s → 0.5 s，清一次性标志 + 30 s 超时回退不变砖
-- [x] **第③步：串口固件升级（代码完成，真机验证待补）**：`tools/ota_send.py` 分帧发 bin → Boot 写 W25Q `0x020000` 暂存 → CRC32 → 擦整个 APP 区 → 写回 + 读回校验 → 复位；长度由镜像头给出、不扫 0xFF，CRC 通过前 APP 区不被动，另留了发 `U` 救砖入口
+- [x] **第③步：串口固件升级（11-15 真机全链路通过）**：`tools/ota_send.py` 分帧发 bin → Boot 写 W25Q `0x020000` 暂存 → CRC32 → 擦整个 APP 区 → 写回 + 读回校验 → 复位；实测 177 帧 / 22 564 B / 5.2 s，`scan_end` 47352 → 22564，界面正常。长度由镜像头给出、不扫 0xFF，CRC 通过前 APP 区不被动，另留了发 `U` 救砖入口
 - [ ] 第④步：失败保护（`boot_try` 计数、APP 无效停 Boot、超限不跳转），故意传坏包验证不变砖
 
 ## 说明
