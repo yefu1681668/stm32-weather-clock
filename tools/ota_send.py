@@ -195,26 +195,40 @@ def wait_reply(uart, uart_tail, expect, timeout):
 
 def wait_prompt(uart, timeout=6.0):
     """发完 'U' 后等 Boot 打印 'waiting for firmware ...'。
-    若板子本来就停在升级窗口（日志已经过去了），也允许继续，后面靠 ACK 判断。
+
+    串口分包是任意的：一行日志可能被切成好几批，也可能一批里塞了好几行。
+    所以逐字节攒「当前行」，另外用累积文本做跨包子串匹配 —— 旧版把整批
+    data 攒进 buf、遇到换行就把整批打印出来，会把 "waiting for firmware"
+    劈成 "waitin" / "g for firmware" 两截，明明打印过却报「没等到」。
+    若板子本来就停在升级窗口（提示已经打印过了），等满 6 s 也属正常，
+    后面靠 HEAD 的 ACK 判断，这里不当成错误。
     """
-    buf = bytearray()
+    line = bytearray()
+    seen = bytearray()
     deadline = time.time() + timeout
     while time.time() < deadline:
         data = uart.read(256)
-        if data:
-            buf += data
-            for b in data:
-                if b == 0x0A:
-                    text = buf.decode("ascii", "replace").strip()
-                    if text:
-                        print("   | " + text)
-                    if "waiting for firmware" in text:
-                        return True                  # 整行匹配，不怕跨包切断
-                    buf = bytearray()
-            if b"waiting for firmware" in data:
-                return True
-        else:
+        if not data:
             time.sleep(0.01)
+            continue
+
+        seen += data
+        for b in data:
+            if b == 0x0A:
+                text = bytes(line).decode("ascii", "replace").strip()
+                if text:
+                    print("   | " + text)
+                line = bytearray()
+            elif b != 0x0D:
+                line += bytes([b])
+
+        if b"waiting for firmware" in seen:
+            tail = bytes(line).decode("ascii", "replace").strip()
+            if tail:
+                print("   | " + tail)
+            return True
+        if len(seen) > 8192:                       # 别让缓冲区无限长
+            seen = seen[-256:]
     return False
 
 
