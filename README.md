@@ -421,7 +421,7 @@ Boot v0.3 + 新 APP 一起重烧后，用 `tools/ota_send.py` 的故障注入开
 
 ```bash
 python tools/ota_send.py --port COM14 --brick --yes      # ① 刷坏固件
-python tools/ota_send.py --port COM14 --monitor          # ② 另开窗口只听日志，按 RESET 观察
+python tools/ota_send.py --port COM14 --monitor          # ② 接着跑（同一窗口即可，脚本已释放 COM 口）
 ```
 
 第 ② 步按三次 RESET，期望日志依次为：
