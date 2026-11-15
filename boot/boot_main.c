@@ -259,9 +259,15 @@ int main(void)
             /* 所有失败路径都汇聚到这里：重新算一次 APP 区 CRC32 取证。
              * CRC 还等于账本值，就证明这次坏包 / 断电没有动过 APP 区。 */
             app_valid = boot_app_valid(&g_param);
-            boot_log(app_valid
-                     ? "[SAFE] app untouched, crc32 still ok -> fallback\r\n"
-                     : "[SAFE] app crc mismatch -> trial boot, no auto-lock\r\n");
+            /* 日志要说实话：账本为空时只查了向量表，不能写成 "crc32 still ok"。
+             * ST-Link 直烧过 APP、或 app_boot_confirm() 作废旧账本后就是这种情况。 */
+            if (!app_valid)
+                boot_log("[SAFE] app INVALID -> stay in boot, reflash needed\r\n");
+            else if (g_param.app_crc32 != 0u &&
+                     g_param.app_size >= 8u && g_param.app_size <= APP_MAX_SIZE)
+                boot_log("[SAFE] app untouched, crc32 still ok -> fallback\r\n");
+            else
+                boot_log("[SAFE] vector table ok (no crc record) -> fallback\r\n");
             recovery = trial_failed || !app_present;
         }
     }

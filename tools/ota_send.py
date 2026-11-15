@@ -152,11 +152,13 @@ def dump_log(uart, tail, timeout=0.02):
 
 
 def dump_plain(uart, tail, timeout=0.02):
-    """负面测试专用：只打印文本日志，控制码（ACK/NAK/ABORT）一律忽略。"""
+    """负面测试专用：只打印文本日志，控制码（ACK/NAK/ABORT）一律忽略。
+    返回 (tail, lines)，lines 是本轮收到的完整文本行，供上层判定回退是否成功。"""
     data = uart.read(256)
+    lines = []
     if not data:
         time.sleep(timeout)
-        return tail
+        return tail, lines
 
     for b in data:
         if b in CONTROL:
@@ -166,8 +168,9 @@ def dump_plain(uart, tail, timeout=0.02):
             text = tail.decode("ascii", "replace").strip()
             if text:
                 print("   | " + text)
+                lines.append(text)
             tail = bytearray()
-    return tail
+    return tail, lines
 
 
 def wait_reply(uart, uart_tail, expect, timeout):
@@ -312,15 +315,33 @@ def main():
         if fault_mode:
             print("[4/5] 负面测试：发 END 后只收日志，不等 DONE ...")
             uart.write(build_frame(TYPE_END, sent, b""))
-            deadline = time.time() + 8.0
+
+            # --truncate 的 END 被判成 premature 后，Boot 不是立刻退出，而是
+            # 继续等下一帧：要连吃 4 次 3 s 帧超时（约 12 s）才 abort 回主流程，
+            # 那时候才会打印 [SAFE] 和 jumping to app。早期版本只等 8 s，
+            # 把最关键的「回退证据」掐掉了，所以这里等够并盯着关键行。
+            deadline = time.time() + 25.0
+            seen = {"reject": False, "safe": False, "jump": False}
             while time.time() < deadline:
-                tail = dump_plain(uart, tail, 0.01)
+                tail, lines = dump_plain(uart, tail, 0.01)
+                for text in lines:
+                    if "CRC MISMATCH" in text or "premature END" in text:
+                        seen["reject"] = True
+                    if "[SAFE]" in text:
+                        seen["safe"] = True
+                    if "jumping to app" in text:
+                        seen["jump"] = True
+                if seen["jump"]:
+                    break
 
             print("\n" + "=" * 62)
             print(" 负面测试结束（这次失败是故意的）")
-            print("   期望：[OTA] CRC MISMATCH / premature END -> APP untouched")
-            print("   期望：[SAFE] app untouched, crc32 still ok -> fallback")
-            print("   期望：jumping to app... + 天气时钟界面照常亮起")
+            print("   坏包被拒 : %s" % ("是" if seen["reject"] else "未捕获"))
+            print("   APP 未动 : %s" % ("是" if seen["safe"] else "未捕获"))
+            print("   回退启动 : %s" % ("是" if seen["jump"] else "未捕获"))
+            print("   结论     : %s" %
+                  ("PASS - 原固件完好，板子已回到天气时钟" if all(seen.values())
+                   else "日志未收全，请确认板子是否仍停在升级窗口（30 s 超时后自动退出）"))
             print("=" * 62)
             return 0
 
