@@ -6,10 +6,17 @@ OTA 上位机：把 APP 固件通过串口发给 BootLoader（零第三方依赖
     python tools/ota_send.py --port COM14 --hex mdk/Objects/Freertos的嵌入式智能天气时钟.hex
     python tools/ota_send.py --port COM14 --corrupt 100     # 第④步：故意传坏包
     python tools/ota_send.py --port COM14 --truncate 2      # 第④步：故意少发 2 帧
+    python tools/ota_send.py --port COM14 --brick --yes     # 第⑤步：刷一份跑不起来的固件
+    python tools/ota_send.py --port COM14 --monitor         # 只听串口日志，按 RESET 观察
 
 --corrupt / --truncate 是「负面测试」开关：让 Boot 收到一包 CRC32 对不上
 或根本没收全的固件，用来验证「APP 区一个字节都不擦、原固件照常启动」。
 这两种模式不会等 DONE，只把 Boot 打印的日志完整显示出来。
+
+--brick 是「破坏性测试」：保留向量表（MSP/PC 合法），只把 Reset_Handler
+入口的 32 B 改成 0xFF，并按坏数据重算 CRC32 —— 于是所有校验都会通过，
+Boot 真的会把这份一上电就 HardFault 的固件写进 APP 区。用来验证试跑计数
+三次失败后自动停 Boot 等重升。**Boot 区永远不会被擦，跑一次正常升级即可救回。**
 
 接线：CH340 TXD -> PA10、RXD -> PA9、GND 共地，115200 8N1。
 运行前请关闭串口助手（COM 口只能被一个程序占用），脚本自己会实时打印 Boot 日志。
@@ -239,7 +246,43 @@ def main():
                     help="负面测试：把第 N 帧 DATA 的首字节翻转 1 bit（帧 CRC16 仍合法，整包 CRC32 会挂）")
     ap.add_argument("--truncate", type=int, default=0, metavar="N",
                     help="负面测试：故意少发最后 N 帧 DATA，触发 premature END")
+    ap.add_argument("--brick", action="store_true",
+                    help="破坏性测试：刷一份向量表合法但一上电就 HardFault 的固件")
+    ap.add_argument("--yes", action="store_true", help="确认执行 --brick（不加会拒绝运行）")
+    ap.add_argument("--monitor", action="store_true",
+                    help="只打开串口打印日志，不发任何命令；按 RESET 观察，Ctrl+C 退出")
     args = ap.parse_args()
+
+    if args.monitor and (args.brick or args.corrupt is not None or args.truncate):
+        print("--monitor 不能和任何测试开关一起用")
+        return 1
+    if args.brick and (args.corrupt is not None or args.truncate):
+        print("--brick 不能和 --corrupt / --truncate 一起用")
+        return 1
+
+    if args.monitor:
+        print("=" * 62)
+        print(" 串口监听（不发任何命令）")
+        print("   按板子 RESET 键观察 Boot 日志，Ctrl+C 退出后 COM 口才会释放")
+        print("=" * 62)
+        with UART(args.port, args.baud) as uart:
+            tail = bytearray()
+            try:
+                while True:
+                    tail, _ = dump_plain(uart, tail, 0.02)
+            except KeyboardInterrupt:
+                print("\n监听结束，串口已释放。")
+        return 0
+
+    if args.brick and not args.yes:
+        print("=" * 62)
+        print(" --brick 会真的把一份跑不起来的固件写进 APP 区")
+        print("   · 天气时钟会黑屏 / 卡死，boot_try 没人清")
+        print("   · 需要手动按 RESET 三次，Boot 才会停住等重升")
+        print("   · Boot 区永不擦写，跑一次正常升级即可救回，不会永久变砖")
+        print(" 确认要继续，请在命令末尾再加 --yes")
+        print("=" * 62)
+        return 1
 
     if args.bin:
         fw = open(args.bin, "rb").read()
@@ -254,6 +297,25 @@ def main():
         print("固件 %d B 超过 APP 分区 %d B" % (len(fw), APP_MAX_SIZE))
         return 1
 
+    if args.brick:
+        # 目标：让所有校验都通过、Boot 真的把固件写进 APP 区，但跳过去立刻死。
+        #   ① 前 8 字节（MSP / 复位向量）必须原样保留 —— boot_app_check()
+        #      只查这两项，改了会在 ota_commit() 第⑤步被拒，测不到跳转失败。
+        #   ② 复位向量指向 Reset_Handler，把入口 32 B 换成 0xFF（Thumb
+        #      未定义指令）→ 一上电就 HardFault，屏幕不亮、没人调
+        #      app_boot_confirm()，boot_try 就会一直累加。
+        #   ③ 按改坏后的数据重算整包 CRC32 写进镜像头 —— 于是 CRC32 /
+        #      读回校验 / 向量表检查全部通过，效果等同于「刷了个坏固件」。
+        pc = int.from_bytes(fw[4:8], "little") & ~1
+        off = pc - APP_START
+        if not (0x100 <= off <= len(fw) - 32):
+            raise ValueError("复位向量 0x%08X 超出固件范围，拒绝构造" % pc)
+        bad = bytearray(fw)
+        bad[off:off + 32] = b"\xFF" * 32
+        fw = bytes(bad)
+        print("! 破坏性模式：Reset_Handler @0x%08X 入口 32 B 已改成 0xFF" % pc)
+        print("! CRC32 按坏数据重算，Boot 会正常收下并写入 APP 区")
+
     head, crc = make_image(fw, args.version)
     chunks = [fw[i:i + 128] for i in range(0, len(fw), 128)]
 
@@ -265,8 +327,10 @@ def main():
         print("--truncate 必须在 1 ~ %d 之间" % (len(chunks) - 1))
         return 1
 
+    mode = ("（负面测试模式，故意失败）" if fault_mode else
+            "（破坏性模式，会刷进跑不起来的固件）" if args.brick else "")
     print("=" * 62)
-    print(" OTA 升级包%s" % ("（负面测试模式，故意失败）" if fault_mode else ""))
+    print(" OTA 升级包%s" % mode)
     print("   源      : %s" % (args.bin or args.hex))
     print("   固件长度: %d B (0x%X)，分 %d 帧" % (len(fw), len(fw), len(chunks)))
     print("   CRC32   : 0x%08X" % crc)
@@ -348,10 +412,29 @@ def main():
         print("[4/5] 发 END，Boot 开始 CRC32 校验 + 擦写 APP（约 2~5 s）...")
         tail = send_frame(uart, tail, TYPE_END, len(chunks), b"", DONE, 30.0, retries=0)
 
-        print("[5/5] DONE！读取复位后的启动日志 ...\n")
+        print("[5/5] %s读取复位后的启动日志 ...\n" %
+              ("坏固件已写入！" if args.brick else "DONE！"))
         deadline = time.time() + 5.0
         while time.time() < deadline:
             _, tail = dump_log(uart, tail, 0.01)
+
+    if args.brick:
+        print("\n" + "=" * 62)
+        print(" 破坏性固件已写入（这是故意的）")
+        print("   屏幕应该黑着 / 卡死，APP 不会打印 boot confirmed")
+        print("")
+        print(" 下一步：另开窗口跑 python tools/ota_send.py --port %s --monitor" % args.port)
+        print("   然后按板子 RESET 键，观察：")
+        print("     第 1 次 -> param: boot_try=1  /  trial boot #2")
+        print("     第 2 次 -> param: boot_try=2  /  trial boot #3")
+        print("     第 3 次 -> boot_try >= 3 -> trial FAILED, stay in boot")
+        print("             -> waiting for recovery firmware...")
+        print("")
+        print(" 救砖（Ctrl+C 退出监听，释放 COM 口后）：")
+        print("   python tools/ota_send.py --port %s" % args.port)
+        print("   Boot 会自动开升级窗口，正常升级一次即可回到天气时钟")
+        print("=" * 62)
+        return 0
 
     print("\n" + "=" * 62)
     print(" 升级完成。核对上面复位后的日志：")

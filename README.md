@@ -4,7 +4,7 @@
 
 本项目为「裸机版天气时钟」的 FreeRTOS 重构版本，同时也是后续 **OTA 远程升级** 改造的起点。
 
-> **状态：全部功能、多任务架构、串口 OTA 全链路与第④步失败保护均已在真机验证通过**（2026-11-10 ~ 11-15）。仅「擦写中途断电」「试跑超限自动停 Boot」两项破坏性测试未做（需要故意把板子刷坏）。详见文末「真机验证记录」与「演示：断网 A/B 对比」。
+> **状态：全部功能、多任务架构、串口 OTA 全链路与第④步失败保护均已在真机验证通过**（2026-11-10 ~ 11-15）。第⑤步破坏性测试工具已备好、真机验证待补（需要故意把板子刷坏，但 Boot 分区独立、不需要 ST-Link 就能救回）。详见文末「真机验证记录」与「演示：断网 A/B 对比」。
 
 ![实物接线：STM32F103C8T6 + ST7735 彩屏 + ESP32-C3 面包板系统](docs/hardware.jpg)
 
@@ -400,14 +400,43 @@ Boot v0.3 + 新 APP 一起重烧后，用 `tools/ota_send.py` 的故障注入开
 | 3 | `--truncate 2`（少发最后 2 帧） | `premature END (got 22656/22800)`，随后板子回到天气时钟；紧接着的正常升级能收到 `U` 并响应 | 长度不符就拒绝提交；`scan_end` 仍是 22800，APP 区没被写短 |
 | 4 | 不带参数（正常恢复升级） | `crc32 ok, erasing APP 47 KB...` → `write 22800 B, readback crc ok` → `DONE, resetting...` → 复位后 `boot_try=1` → `trial boot #2 (APP must confirm)` → `jumping to app...` → `[OTA] boot confirmed (screen up)` | 失败之后还能正常升级，**试跑确认闭环 1 → 2 → APP 确认 → 0 全部打通**，屏幕显示 15:45 天气界面 |
 
-> 第 3 项当时只截到 `premature END`：脚本旧版在 END 后只读 8 s 日志，而 Boot 判 premature END 后会继续等下一帧、连吃 4 次 3 s 帧超时（约 12 s）才退出状态机打印 `[SAFE]`。现已把负面测试收尾改为**最多等 25 s、见到 `jumping to app...` 提前收工**，并逐项打印「坏包被拒 / APP 未动 / 回退启动」的 PASS 判定。重跑一次 `--truncate 2` 即可拿到完整日志。
+> 第 3 项第一次只截到 `premature END`：脚本旧版在 END 后只读 8 s 日志，而 Boot 判 premature END 后会继续等下一帧、连吃 4 次 3 s 帧超时（约 12 s）才退出状态机打印 `[SAFE]`。把负面测试收尾改成**最多等 25 s、见到 `jumping to app...` 提前收工**并逐项打印 PASS 判定后，**补测已通过**：`premature END` → `too many frame errors -> abort` → `[SAFE] app untouched, crc32 still ok -> fallback` → `jumping to app...`，三项判定全「是」、`结论：PASS - 原固件完好`。
 >
 > 第 1 项里 `scan_end=22564`、第 2 项变成 `22800`，是两次测试之间用 Keil 重烧了新 APP 所致；`crc32 no record` 正是 `app_boot_confirm()` 检测到账本 CRC 与直烧的新固件不符后作废旧记录的结果，不是异常。
 
-**仍未验证（破坏性测试，谨慎做）**
+### OTA BootLoader 第五步：破坏性测试（工具已备好，真机验证待补）
 
-- 升级进行到 `erasing APP 47 KB...` 时断电：期望上电后进入试跑计数，最终自动停 Boot 等重升。可能真的需要 ST-Link 救场。
-- 刷一份向量表合法但一上电就 HardFault 的固件：期望 `boot_try` 累加到 3 后停 Boot。
+前面四轮都是「把坏固件挡在门外」，这一关要**真的把坏固件放进来**，验证「新固件跑不起来 → 自动停 Boot → 还能救回来」。`tools/ota_send.py --brick` 的做法：
+
+| 环节 | 做法 / 效果 |
+|---|---|
+| 构造 | 保留向量表前 8 B（MSP `0x20004698`、PC `0x08004198` 都合法），只把 `Reset_Handler` 入口 32 B 改成 `0xFF`，再**按改坏后的数据重算 CRC32**（`0x0B5BF038` → `0xFF4A091F`） |
+| 为什么能骗过 Boot | `ota_commit()` 的整包 CRC32、Flash 读回 CRC、向量表检查用的是同一份坏数据，全部会通过 —— Boot 于是真的擦 APP 区、写回、复位 |
+| 为什么必然失败 | 复位后一进 `Reset_Handler` 就是 Thumb 未定义指令 → HardFault，屏幕不亮，`app_boot_confirm()` 永远不会被调用，`boot_try` 只增不减 |
+| 等价场景 | 和「擦写 APP 中途断电留下半截固件」是同一类失败：APP 跑不起来，且 `boot_try=1` 已在动手擦之前预先记账 |
+
+**为什么不会永久变砖**：Boot 在 `0x08000000` 起的独立 16 KB 分区，整个 OTA 流程只擦 `0x08004000` 之后的 APP 区，Boot 与 `0x0800FC00` 参数页都不在擦除范围内。所以只要 NRST 还能复位，Boot 就一定在；停进恢复模式后它每 30 s 自动开一轮升级窗口，跑一次正常升级脚本就能救回。**不需要 ST-Link。**
+
+**操作顺序**（`D:\stm32_10.25\weather_clock`，先关掉串口助手）：
+
+```bash
+python tools/ota_send.py --port COM14 --brick --yes      # ① 刷坏固件
+python tools/ota_send.py --port COM14 --monitor          # ② 另开窗口只听日志，按 RESET 观察
+```
+
+第 ② 步按三次 RESET，期望日志依次为：
+
+| 次数 | 期望日志 |
+|---|---|
+| 1 | `param: ... boot_try=1` → `trial boot #2 (APP must confirm)` → `jumping to app...`（然后死，不再有输出） |
+| 2 | `param: ... boot_try=2` → `trial boot #3` → `jumping to app...` |
+| 3 | `boot_try >= 3 -> trial FAILED, stay in boot` → `no bootable app -> stay in boot` → `waiting for firmware 30000 ms...`，LED 5 Hz 慢闪不停 |
+
+**救砖**：在 ② 的窗口按 `Ctrl+C` 释放 COM 口，然后跑一次普通升级 `python tools/ota_send.py --port COM14`。`wait_prompt()` 会匹配到恢复窗口打印的 `waiting for firmware`，正常收 HEAD/DATA/END，写回好固件并回到天气时钟界面。日志应重新出现 `[OTA] boot confirmed (screen up)`。
+
+> `--monitor` 只打开串口打印日志、不发任何命令；`--brick` 必须配 `--yes` 才会执行，防止误粘贴。离线自检已确认：坏固件仍是 22 800 B / 179 帧，前 8 B 逐字节不变，镜像头 CRC32 与 Boot 读回校验一致。
+
+**可选第 3 关（真断电，风险最高）**：在脚本打印 `erasing APP 47 KB...` 的瞬间按 RESET 键（比拔 USB 安全，效果等同断电）。期望上电后 APP 区半截、向量表或账本校验失败，`recovery=1` 直接停 Boot 自动等重升。这个窗口只有零点几秒，不好抓，失败就多试几次；救砖路径同上。
 
 > 负面测试离线自检已通过：正常包 22 800 B / 179 帧，翻转一帧后整包 CRC32 变化、但该帧 CRC16 仍合法 —— 正是 Boot 能收下数据、最后才判 CRC32 失败的效果。
 
@@ -484,9 +513,11 @@ python tools/ota_send.py --port COM14
 ```bash
 python tools/ota_send.py --port COM14 --corrupt 100    # 翻转第 100 帧 1 bit
 python tools/ota_send.py --port COM14 --truncate 2     # 少发最后 2 帧
+python tools/ota_send.py --port COM14 --brick --yes    # 真刷一份跑不起来的固件（破坏性）
+python tools/ota_send.py --port COM14 --monitor        # 只听日志，按 RESET 观察 Boot
 ```
 
-脚本不会等 `DONE`，只收日志并打印「坏包被拒 / APP 未动 / 回退启动」三项判定。`--truncate` 时 Boot 要连吃 4 次 3 s 帧超时才退出状态机，所以脚本最多等 25 s，看到 `jumping to app...` 就提前收工。
+脚本不会等 `DONE`，只收日志并打印「坏包被拒 / APP 未动 / 回退启动」三项判定。`--truncate` 时 Boot 要连吃 4 次 3 s 帧超时才退出状态机，所以脚本最多等 25 s，看到 `jumping to app...` 就提前收工。破坏性测试的完整步骤、期望日志与救砖路径见「OTA BootLoader 第五步」。
 
 > Boot 只在改 `boot/` 目录时才需要用 ST-Link 重烧；日常改天气时钟只要编译 APP 生成新 hex，再跑一次上面的命令即可。协议细节与验证清单见「OTA BootLoader 第三步 / 第四步」。
 
@@ -647,7 +678,7 @@ Boot v0.3 + 带 `app_boot_confirm()` 的新 APP（22 800 B / 179 帧 / CRC32 `0x
 |---|---|---|
 | 坏包：翻第 100 帧 1 bit，帧 CRC16 合法但整包 CRC32 不符 | `CRC MISMATCH w25q=0xE953255C head=0x0B5BF038 -> APP untouched` | 通过，拒绝提交且未擦 APP |
 | 坏包后回退 | `commit FAILED -> abort` → `[SAFE] app untouched, crc32 still ok -> fallback` → `jumping to app...`，复位后第二组启动日志仍是 `scan_end=22564` | 通过，原固件完好、界面照常亮 |
-| 截断：少发最后 2 帧 | `premature END (got 22656/22800)`，随后板子回到天气时钟、下一次升级仍能收到 `U` | 通过，长度不符拒绝提交 |
+| 截断：少发最后 2 帧（补测） | `premature END (got 22656/22800)` → `too many frame errors -> abort` → `[SAFE] app untouched, crc32 still ok -> fallback` → `jumping to app...`，脚本三项判定全「是」 | 通过，长度不符拒绝提交，约 12 s 后回退原固件 |
 | ST-Link 直烧新 APP 后账本失配 | `crc32 no record, scan_end=22800`，APP 自己打印 `boot confirmed ... drop stale app crc record` | 通过，作废旧账本而非锁板 |
 | 失败后仍能正常升级 | `crc32 ok, erasing APP 47 KB...` → `write 22800 B, readback crc ok` → `DONE, resetting...` | 通过，5.2 s / 179 帧 |
 | 试跑确认闭环 | 复位后 `boot_try=1` → `trial boot #2 (APP must confirm)` → `jumping to app...` → `[OTA] boot confirmed (screen up)` | 通过，`1 → 2 → APP 确认 → 0` |
@@ -662,7 +693,7 @@ Boot v0.3 + 带 `app_boot_confirm()` 的新 APP（22 800 B / 179 帧 / CRC32 `0x
 - [x] **第②步：升级请求（11-14 真机全链路通过）**：APP 串口 `U` → 写参数页 `upgrade_req` → 复位回 Boot；Boot 窗口 3 s → 0.5 s，清一次性标志 + 30 s 超时回退不变砖
 - [x] **第③步：串口固件升级（11-15 真机全链路通过）**：`tools/ota_send.py` 分帧发 bin → Boot 写 W25Q `0x020000` 暂存 → CRC32 → 擦整个 APP 区 → 写回 + 读回校验 → 复位；实测 177 帧 / 22 564 B / 5.2 s，`scan_end` 47352 → 22564，界面正常。长度由镜像头给出、不扫 0xFF，CRC 通过前 APP 区不被动，另留了发 `U` 救砖入口
 - [x] **第④步：失败保护（11-15 真机验证通过）**：`boot_try` 试跑确认 + 账本 CRC32 校验 + 擦 APP 前先记账 + 停 Boot 自动循环等重升；坏包 / 截断 / 恢复三轮故障注入实测通过，`trial boot #2` → `[OTA] boot confirmed` 闭环成立
-- [ ] 破坏性测试（可选）：擦 APP 中途断电、刷一份跑不起来的固件验证 `boot_try >= 3` 自动停 Boot
+- [ ] **第⑤步破坏性测试（工具已备好，真机验证待补）**：`--brick` 刷跑不起来的固件、三次 RESET 验证 `boot_try >= 3` 自动停 Boot、再正常升级救砖；可选真断电（擦 APP 时按 RESET）
 
 ## 说明
 
