@@ -1,7 +1,7 @@
 /**
  ******************************************************************************
  * @file    app_upgrade.c
- * @brief   APP 侧的"请求升级"入口（OTA 第②步）
+ * @brief   APP 侧的「请求升级 / 启动确认」入口（OTA 第②、④步）
  *
  * 这个函数里唯一有点危险的动作是擦写内部 Flash 参数页。之所以敢在
  * 运行中的 FreeRTOS 里直接做，是因为写完马上 NVIC_SystemReset()：
@@ -16,6 +16,7 @@
 #include "app_upgrade.h"
 #include "boot_cfg.h"
 #include "boot_param.h"
+#include "boot_crc.h"
 #include "stm32f1xx_hal.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -95,4 +96,49 @@ void app_upgrade_poll(void)
 
     g_upgrade_flag = 0;
     app_request_upgrade();
+}
+
+void app_boot_confirm(void)
+{
+    boot_param_t p;
+    int ok;
+    int mismatch;
+
+    boot_param_read(&p);
+
+    /* 账本里的 app_size / app_crc32 是上一次 OTA 成功时写下的。
+     * 如果后来用 ST-Link 直接烧过 APP，这两个值就对不上了，Boot 每次
+     * 开机都会把它当成「可疑固件」多记一次试跑。既然这版 APP 已经真的
+     * 跑起来了，就把旧账本作废，避免以后每次上电都白擦一次参数页。 */
+    mismatch = (p.app_crc32 != 0u &&
+                p.app_size >= 8u && p.app_size <= APP_MAX_SIZE &&
+                boot_crc32((const void *)APP_START_ADDR, p.app_size) != p.app_crc32);
+
+    /* 正常开机（没有待确认的试跑、账本也一致）：直接返回，
+     * 一次 Flash 擦写都不做，不磨损参数页。 */
+    if (p.boot_try == 0 && !mismatch)
+        return;
+
+    printf("\r\n[OTA] boot confirmed (screen up)");
+    if (mismatch)
+        printf(", drop stale app crc record");
+    printf("\r\n");
+    while ((USART1->SR & USART_SR_TC) == 0)
+        ;                                    /* 等日志最后一个字节发完 */
+
+    p.boot_try = 0;
+    if (mismatch)
+    {
+        p.app_size  = 0;
+        p.app_crc32 = 0;
+    }
+
+    /* 和 app_request_upgrade() 同样的保护：挂起调度器但不关中断，
+     * HAL_FLASHEx_Erase() 内部要靠 TIM7 的 HAL_GetTick() 判断超时。 */
+    vTaskSuspendAll();
+    ok = boot_param_write(&p);
+    xTaskResumeAll();
+
+    if (!ok)
+        printf("[OTA] WARN: confirm write failed\r\n");
 }

@@ -30,4 +30,20 @@ void app_upgrade_rx_isr(void);
  *  正常运行时只是一次 volatile 判断，开销可以忽略。 */
 void app_upgrade_poll(void);
 
+/* ---------------- 第④步：启动成功确认 ----------------
+ *
+ * Boot 在升级成功后把参数页 boot_try 置 1，意思是「这份固件还没被证明
+ * 能启动」，之后每次上电都会 +1，达到上限就停 Boot 等重新升级。
+ * APP 必须在一个「确实跑起来了」的位置调一次 app_boot_confirm() 把
+ * boot_try 清 0 —— 本项目选在 ui_task 画完屏幕首帧之后。
+ *
+ * 于是刷进去一个一上电就 HardFault 的固件时，没人来清这个计数，
+ * 三次重启后板子自动停在 Boot 等待救砖，不会无限重启。
+ *
+ * 配套关系：Boot v0.3 与带 app_boot_confirm() 的 APP 必须一起烧录。
+ * 只烧 Boot 会让 boot_try 一直累加，第三次上电就停 Boot。 */
+
+/** 在屏幕首帧画完后调用一次：向 Boot 报「我活下来了」，清 boot_try。 */
+void app_boot_confirm(void);
+
 #endif /* __APP_UPGRADE_H__ */

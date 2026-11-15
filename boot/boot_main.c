@@ -1,20 +1,22 @@
 /**
  ******************************************************************************
  * @file    boot_main.c
- * @brief   OTA BootLoader 主程序（第③步：串口固件升级）
+ * @brief   OTA BootLoader 主程序（第④步：失败保护）
  *
  * 上电后的完整动作：
- *   初始化时钟/串口/LED → 读参数页 → 检查 APP 是否可跳
+ *   初始化时钟/串口/LED → 读参数页 → 校验 APP 完整性（向量表 + 账本 CRC32）
+ *   → boot_try 试跑计数：超限就停 Boot，没超就 +1 再跳
  *   → 500 ms 常规窗口（LED 5 Hz 快闪，期间串口发 'U' 可手动请求升级）
- *   → 若参数页有升级请求 / 收到命令：立刻清标志，进入串口升级状态机
+ *   → 有升级请求 / 收到命令 / 试跑失败：进串口升级状态机
  *     （HEAD/DATA/END 分帧 -> W25Q 暂存 -> CRC32 -> 擦写 APP -> 复位）
- *   → 传坏包或 30 s 没等到上位机，APP 区一个字节都不擦，照常跳回 APP
+ *   → 坏包或 30 s 没等到上位机：APP 区一字节不擦，照常跳回原 APP
+ *   → APP 无效或试跑超限：自动循环等待重新升级，插上串口即可救砖
  *
  * LED 语言（不用接串口也能判断状态）：
  *   5 Hz 快闪 0.5 s 后跳走  = 正常启动
  *   2 Hz 慢闪最长 30 s      = 已进入升级等待
  *   10 Hz 快闪不停          = HSE 时钟起不来
- *   5 Hz 慢闪不停           = APP 无效 / 校验不通过，停在 Boot（发 U 可救砖）
+ *   5 Hz 慢闪不停           = APP 无效 / 试跑超限，自动循环等重升（也可发 U）
  *
  * 烧录设置（务必确认，否则会把自己锁死）：
  *   IROM1 起始 0x08000000，大小 0x4000（16 KB）
@@ -26,6 +28,7 @@
 #include "boot_jump.h"
 #include "boot_uart.h"
 #include "boot_ota.h"
+#include "boot_crc.h"
 #include "stm32f1xx_hal.h"
 
 static boot_param_t g_param;
@@ -100,6 +103,30 @@ static void boot_led_toggle(void)
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, on ? GPIO_PIN_RESET : GPIO_PIN_SET);
 }
 
+/* ---------------- 第④步：APP 完整性检查 ---------------- */
+
+/**
+ * 向量表检查 + 账本 CRC32 校验。
+ *
+ * boot_app_check() 只看 MSP / PC 两个 32 位数，太弱：擦写 APP 中途断电
+ * 留下的「半截固件」，向量表往往还是合法的，跳过去必死。参数页里存着
+ * 上一次成功升级时的 app_size / app_crc32，按那个长度重算一遍 CRC32
+ * 就能发现内容被改过。
+ *
+ * 账本为空（首次上电 / 参数页被擦过）时退回只查向量表，
+ * 绝不因为「没记账」就把一块好板子锁在 Boot 里。
+ */
+static int boot_app_valid(const boot_param_t *p)
+{
+    if (!boot_app_check(APP_START_ADDR))
+        return 0;
+
+    if (p->app_size >= 8u && p->app_size <= APP_MAX_SIZE && p->app_crc32 != 0u)
+        return boot_crc32((const void *)APP_START_ADDR, p->app_size) == p->app_crc32;
+
+    return 1;
+}
+
 /* ---------------- 主流程 ---------------- */
 
 int main(void)
@@ -131,18 +158,17 @@ int main(void)
     boot_log_u32(g_param.boot_try);
     boot_log("\r\n");
 
+    /* 第④步：开机就用「向量表 + 账本 CRC32」判断能不能跳。
+     * scan_end 只用于诊断（含残留旧数据），绝不参与任何判断。 */
+    int app_valid = boot_app_valid(&g_param);
     boot_log("app @");
     boot_log_hex(APP_START_ADDR);
-    if (boot_app_check(APP_START_ADDR))
+    boot_log(app_valid ? " valid (crc32 " : " INVALID");
+    if (app_valid)
     {
-        /* scan_end 只是「最后一个非 0xFF 字节」的位置，含 APP 区残留旧数据，
-         * 不是固件真实长度。详见 boot_jump.c 里 boot_app_measure_size 的说明。 */
-        boot_log(" valid, scan_end=");
+        boot_log(g_param.app_crc32 ? "ok" : "no record");
+        boot_log("), scan_end=");
         boot_log_u32(boot_app_measure_size(APP_START_ADDR, APP_MAX_SIZE));
-    }
-    else
-    {
-        boot_log(" INVALID");
     }
     boot_log("\r\n");
 
@@ -163,6 +189,37 @@ int main(void)
         {
             /* 清不掉就别停：否则每次开机都白等 30 秒，比丢一次请求更糟。 */
             boot_log("WARN: clear upgrade_req failed, ignore request\r\n");
+        }
+    }
+
+    /* ---------------- 第④步：试跑计数 ----------------
+     * 满足任一条件就给这次启动记一次「试跑」：
+     *   - boot_try 非 0：刚升级完，或上一轮试跑还没被 APP 确认
+     *   - 账本 CRC32 对不上：可能被 ST-Link 直烧过，或擦写中途断过电
+     * 记到上限就停 Boot 等重升；APP 真跑起来会由 app_boot_confirm() 清 0。
+     * 正常开机（boot_try=0、CRC 一致）一次参数页擦写都不做，不磨损 Flash。
+     * 用户主动请求升级时不计数，因为升级成功会把 boot_try 重置为 1。 */
+    int trial_failed = 0;
+    int app_present  = boot_app_check(APP_START_ADDR);
+    if (g_param.boot_try >= BOOT_TRY_MAX)
+    {
+        trial_failed = 1;
+        boot_log("boot_try >= ");
+        boot_log_u32(BOOT_TRY_MAX);
+        boot_log(" -> trial FAILED, stay in boot\r\n");
+    }
+    else if ((g_param.boot_try > 0 || !app_valid) && app_present && !stay_for_upgrade)
+    {
+        g_param.boot_try++;
+        if (boot_param_write(&g_param))
+        {
+            boot_log("trial boot #");
+            boot_log_u32(g_param.boot_try);
+            boot_log(" (APP must confirm)\r\n");
+        }
+        else
+        {
+            boot_log("WARN: boot_try write failed\r\n");
         }
     }
 
@@ -190,11 +247,26 @@ int main(void)
 
     /* 升级等待窗口（第③步）：真正的固件接收状态机。
      * 升级成功会直接 NVIC_SystemReset() 不返回；超时 / 坏包 / 中止返回 0，
-     * 此时 APP 区一个字节都没被擦过，主流程照常跳回原来的 APP。 */
-    if (stay_for_upgrade)
-        boot_ota_run(&g_param);
+     * 此时 APP 区一个字节都没被擦过，主流程照常跳回原来的 APP。
+     *
+     * 第④步新增 recovery：APP 无效或试跑超限时不用人手先发 'U'，直接进
+     * 升级窗口，超时后下面的 while 会自动再开一轮。 */
+    int recovery = trial_failed || !app_present;
+    if (stay_for_upgrade || recovery)
+    {
+        if (!boot_ota_run(&g_param))
+        {
+            /* 所有失败路径都汇聚到这里：重新算一次 APP 区 CRC32 取证。
+             * CRC 还等于账本值，就证明这次坏包 / 断电没有动过 APP 区。 */
+            app_valid = boot_app_valid(&g_param);
+            boot_log(app_valid
+                     ? "[SAFE] app untouched, crc32 still ok -> fallback\r\n"
+                     : "[SAFE] app crc mismatch -> trial boot, no auto-lock\r\n");
+            recovery = trial_failed || !app_present;
+        }
+    }
 
-    if (boot_app_check(APP_START_ADDR))
+    if (!recovery && app_present)
     {
         boot_log("jumping to app...\r\n");
         HAL_Delay(10);                       /* 等最后一个字节发完 */
@@ -203,22 +275,33 @@ int main(void)
     }
     else
     {
-        boot_log("no valid app -> stay in boot\r\n");
+        boot_log("no bootable app -> stay in boot\r\n");
     }
 
-    /* 停在 Boot：5 Hz 慢闪。同时保留"救砖入口"——
-     * 万一第③步擦写 APP 中途失败，APP 无效、板子看似变砖，
-     * 串口发一个 'U' 就能重进升级状态机，再传一次固件即可恢复。 */
+    /* 停在 Boot：5 Hz 慢闪。
+     * recovery=1（APP 无效 / 试跑超限）：自动每 30 s 重开一轮升级窗口，
+     * 插上串口直接跑脚本就能救砖，不用先发 'U'；
+     * 否则保留手动 'U' 入口，方便正常运行时临时升级。 */
     while (1)
     {
         boot_led_toggle();
         HAL_Delay(100);
 
-        int ch = boot_uart_getchar();
-        if (ch == BOOT_CMD_CHAR || ch == (BOOT_CMD_CHAR + 0x20))
+        if (recovery)
         {
-            boot_log("\r\nrecovery upgrade request\r\n");
-            boot_ota_run(&g_param);
+            boot_log("waiting for recovery firmware...\r\n");
+            boot_ota_run(&g_param);           /* 每轮 30 s，超时就再来 */
+            app_present = boot_app_check(APP_START_ADDR);
+            recovery    = trial_failed || !app_present;
+        }
+        else
+        {
+            int ch = boot_uart_getchar();
+            if (ch == BOOT_CMD_CHAR || ch == (BOOT_CMD_CHAR + 0x20))
+            {
+                boot_log("\r\nrecovery upgrade request\r\n");
+                boot_ota_run(&g_param);
+            }
         }
     }
 }

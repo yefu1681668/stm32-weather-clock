@@ -4,7 +4,7 @@
 
 本项目为「裸机版天气时钟」的 FreeRTOS 重构版本，同时也是后续 **OTA 远程升级** 改造的起点。
 
-> **状态：全部功能、多任务架构与串口 OTA 全链路均已在真机验证通过**（2026-11-10 ~ 11-15），详见文末「真机验证记录」与「演示：断网 A/B 对比」。
+> **状态：全部功能、多任务架构与串口 OTA 全链路均已在真机验证通过**（2026-11-10 ~ 11-15）；**第④步失败保护代码完成，真机验证待补**。详见文末「真机验证记录」与「演示：断网 A/B 对比」。
 
 ![实物接线：STM32F103C8T6 + ST7735 彩屏 + ESP32-C3 面包板系统](docs/hardware.jpg)
 
@@ -347,7 +347,55 @@ jumping to app...
 
 `scan_end` 从 11-14 的 47352（APP 区残留旧固件）变成 **22564**，正好等于协议头里的 `length`，说明整个 APP 区确实被擦过、再按新固件长度写回；`upgrade_req=0` 说明一次性标志被正确清掉；`jumping to app...` 之后天气时钟界面正常亮起。至此 **「触发 → 分帧 → W25Q 暂存 → CRC32 → 擦 → 写 → 读回校验 → 复位 → 跳转」全链路真机跑通**，以后改 APP 只需编译出新 hex 再跑一次脚本，不必再动 ST-Link。
 
-> 尚未验证：坏包 / 断电时「APP 区不被动」这条安全性，以及第④步的 `boot_try` 失败保护。
+> 上面这条「尚未验证」已在第④步用代码实现，真机验证清单见下一节。
+
+### OTA BootLoader 第四步：失败保护（2026-11-15）
+
+第③步解决「怎么把新固件刷进去」，第④步解决「刷坏了怎么办」。单分区 OTA 没有 A/B 双分区，做不到真正回滚，所以防线的核心是两句话：**任何一步不成功就别擦 APP 区；新固件没证明自己能跑，就别把它当最终版本。**
+
+> 本节把 Boot 版本从 v0.2 升到 **v0.3**。上面第③步的日志是 11-15 上午用 v0.2 跑出来的历史记录，数字保持不变。
+
+**四条防线**
+
+| 场景 | 机制 | 期望结果 |
+|---|---|---|
+| 传坏包 / 帧 CRC 错 / 中途断线 | 每帧 CRC16 + 整包 CRC32 全过了才允许擦 APP | `CRC MISMATCH ... -> APP untouched`，原固件照常启动 |
+| 擦写 APP 中途断电 | 动手擦之前先把 `boot_try=1` 写进参数页 | 重启后进入试跑计数，三次跳不起来自动停 Boot 等重升 |
+| 刷了个一上电就 HardFault 的固件 | APP 在屏幕首帧画完后调 `app_boot_confirm()` 清 `boot_try`；没人清就累加 | `boot_try >= 3 -> trial FAILED, stay in boot`，自动循环等重新升级 |
+| ST-Link 直烧过 APP、账本 CRC 对不上 | 不直接锁板，先记一次试跑；APP 真跑起来后作废旧账本 | 不会把好板子误判成砖，也不会每次开机白擦参数页 |
+
+**试跑确认（trial boot）状态机**
+
+```
+升级成功 → 参数页 boot_try=1（这份固件还没被证明能启动）
+   ↓ 上电
+Boot: boot_try < 3 → +1 → 跳 APP
+   ↓
+APP 画完屏幕首帧 → app_boot_confirm() → boot_try=0
+   ✅ 以后正常开机一次参数页擦写都不做
+   ↓（APP 跑不起来，没人确认）
+Boot: boot_try=2 → 再跳 → 仍失败 → boot_try=3
+   ↓
+Boot: boot_try >= 3 → 不跳，5 Hz 慢闪，每 30 s 自动重开升级窗口
+```
+
+`boot_app_valid()` = 向量表（MSP / PC）检查 + 用账本里的 `app_size / app_crc32` 重算一遍 APP 区 CRC32。账本为空（首次上电）时只查向量表；CRC 不符时**不直接停 Boot**，而是走上面的试跑流程 —— 因为 ST-Link 直烧也会造成失配，一上来就锁死会误伤好板子。
+
+停在恢复模式时**不用人手先发 `U`**：`recovery=1` 时主循环每 30 s 自动重开一轮 `boot_ota_run()`，插上串口直接跑脚本就能救砖。坏包 / 超时失败后 Boot 会额外打印 `[SAFE] app untouched, crc32 still ok -> fallback`，这是「APP 区没被动」的硬证据。
+
+**版本配套（重要）**：Boot v0.3 与带 `app_boot_confirm()` 的 APP **必须一起烧录**。只烧 Boot 不烧 APP，`boot_try` 就永远没人清，第三次上电会停 Boot。
+
+**编译结果**（11-15 Keil UV4 命令行）：Boot `Code=8400 / RO=320 / RW=20 / ZI=2116`，0 Error / 0 Warning，仍在 16 KB 分区内；APP **22 800 B / 179 帧 / CRC32 `0x0B5BF038`**（比第③步的 22 564 B 多了 236 B 启动确认逻辑），仍远小于 47 KB 分区。
+
+**真机验证（代码完成，待补）**
+
+1. 两个工程都 `F7` → `F8` 重烧（Erase Sectors）：`mdk_boot` 的 Boot v0.3 + `mdk` 的新 APP。第一次开机可能打印 `trial boot #1` 和 `[OTA] boot confirmed ... drop stale app crc record`，属正常：旧账本记的是第③步那份 22 564 B 的 hex，作废一次即可，第二次开机应完全正常。
+2. **坏包测试**：`python tools/ota_send.py --port COM14 --corrupt 100` —— 故意把第 100 帧翻 1 bit（帧 CRC16 重算后仍合法，整包 CRC32 对不上）。期望 `CRC MISMATCH -> APP untouched` + `[SAFE] app untouched, crc32 still ok -> fallback` + `jumping to app...`，屏幕照常亮。
+3. **截断测试**：`python tools/ota_send.py --port COM14 --truncate 2` —— 少发最后 2 帧就发 END。期望 `premature END` + 同样的 SAFE 回退。
+4. **恢复测试**：停在 Boot 时直接跑一次不带故障参数的 `python tools/ota_send.py --port COM14`，期望重新升级成功并回到天气时钟。
+5. **断电测试（可选，有风险）**：升级进行到 `erasing APP 47 KB...` 时断电，再上电期望进入试跑计数、最终停 Boot 自动等重升。这一步可能真的需要 ST-Link 救场，谨慎做。
+
+> 负面测试离线自检已通过：正常包 22 800 B / 179 帧，翻转一帧后整包 CRC32 变化、但该帧 CRC16 仍合法 —— 正是 Boot 能收下数据、最后才判 CRC32 失败的效果。
 
 ## 目录结构
 
@@ -460,9 +508,9 @@ Program Size: Code=7788  RO-data=320  RW-data=20  ZI-data=2116
 | Boot Flash | 8 128 B | 16 KB | 49.6% |
 | Boot RAM | 2 136 B | 20 KB | 10.4% |
 
-Boot 只链了 HAL 的 GPIO / RCC / FLASH / PWR / CORTEX 五类模块，没链 UART（串口用寄存器写）、没链屏驱动、没链 FreeRTOS。第③步把分帧状态机 + 软件 SPI Flash 驱动加进来后是 8 KB，16 KB 里还剩约 8 KB。RAM 2 136 B 里有一半是 2 KB 栈（第③步从 1 KB 调上来的），实测量足够。
+Boot 只链了 HAL 的 GPIO / RCC / FLASH / PWR / CORTEX 五类模块，没链 UART（串口用寄存器写）、没链屏驱动、没链 FreeRTOS。第③步把分帧状态机 + 软件 SPI Flash 驱动加进来后是 8 128 B；第④步再加试跑计数与 CRC 校验是 8 740 B，16 KB 里还剩约 7.6 KB。RAM 2 136 B 里有一半是 2 KB 栈（第③步从 1 KB 调上来的），实测量足够。
 
-**图标外置前后的体积账**（下表是 11-11 图标外置完成时的快照，之后第②步又加了约 1.4 KB；第③步只改 Boot，APP 侧 22 564 B 逐字节未变）
+**图标外置前后的体积账**（下表是 11-11 图标外置完成时的快照，之后第②步又加了约 1.4 KB；第③步只改 Boot，APP 侧 22 564 B 逐字节未变；第④步 APP 侧新增启动确认后为 22 800 B）
 
 | | Flash | RO-data | RAM |
 |---|---|---|---|
@@ -577,7 +625,8 @@ Boot 只链了 HAL 的 GPIO / RCC / FLASH / PWR / CORTEX 五类模块，没链 U
 - [x] **BootLoader 骨架（第①步）**：`boot/` + `mdk_boot/` 独立工程，16 KB 分区、参数页、MSP/PC 校验、3 秒窗口、VTOR 跳转；APP 已迁到 `0x08004000`，真机两级启动通过
 - [x] **第②步：升级请求（11-14 真机全链路通过）**：APP 串口 `U` → 写参数页 `upgrade_req` → 复位回 Boot；Boot 窗口 3 s → 0.5 s，清一次性标志 + 30 s 超时回退不变砖
 - [x] **第③步：串口固件升级（11-15 真机全链路通过）**：`tools/ota_send.py` 分帧发 bin → Boot 写 W25Q `0x020000` 暂存 → CRC32 → 擦整个 APP 区 → 写回 + 读回校验 → 复位；实测 177 帧 / 22 564 B / 5.2 s，`scan_end` 47352 → 22564，界面正常。长度由镜像头给出、不扫 0xFF，CRC 通过前 APP 区不被动，另留了发 `U` 救砖入口
-- [ ] 第④步：失败保护（`boot_try` 计数、APP 无效停 Boot、超限不跳转），故意传坏包验证不变砖
+- [x] **第④步：失败保护（代码完成，真机验证待补）**：`boot_try` 试跑确认 + 账本 CRC32 校验 + 擦 APP 前先记账 + 停 Boot 自动循环等重升；上位机新增 `--corrupt` / `--truncate` 负面测试开关；两个工程命令行编译 0 Error / 0 Warning
+- [ ] 第④步真机验证：坏包 / 截断 / 恢复 / 断电四项
 
 ## 说明
 

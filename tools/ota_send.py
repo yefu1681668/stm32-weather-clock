@@ -4,6 +4,12 @@ OTA 上位机：把 APP 固件通过串口发给 BootLoader（零第三方依赖
 用法（在仓库根目录执行）：
     python tools/ota_send.py --port COM14
     python tools/ota_send.py --port COM14 --hex mdk/Objects/Freertos的嵌入式智能天气时钟.hex
+    python tools/ota_send.py --port COM14 --corrupt 100     # 第④步：故意传坏包
+    python tools/ota_send.py --port COM14 --truncate 2      # 第④步：故意少发 2 帧
+
+--corrupt / --truncate 是「负面测试」开关：让 Boot 收到一包 CRC32 对不上
+或根本没收全的固件，用来验证「APP 区一个字节都不擦、原固件照常启动」。
+这两种模式不会等 DONE，只把 Boot 打印的日志完整显示出来。
 
 接线：CH340 TXD -> PA10、RXD -> PA9、GND 共地，115200 8N1。
 运行前请关闭串口助手（COM 口只能被一个程序占用），脚本自己会实时打印 Boot 日志。
@@ -145,6 +151,25 @@ def dump_log(uart, tail, timeout=0.02):
     return None, tail
 
 
+def dump_plain(uart, tail, timeout=0.02):
+    """负面测试专用：只打印文本日志，控制码（ACK/NAK/ABORT）一律忽略。"""
+    data = uart.read(256)
+    if not data:
+        time.sleep(timeout)
+        return tail
+
+    for b in data:
+        if b in CONTROL:
+            continue
+        tail += bytes([b])
+        if b == 0x0A:
+            text = tail.decode("ascii", "replace").strip()
+            if text:
+                print("   | " + text)
+            tail = bytearray()
+    return tail
+
+
 def wait_reply(uart, uart_tail, expect, timeout):
     """等一个控制码，期间把 Boot 打的文本日志实时显示出来。"""
     deadline = time.time() + timeout
@@ -207,6 +232,10 @@ def main():
     ap.add_argument("--version", type=int, default=2, help="写进镜像头的版本号")
     ap.add_argument("--no-trigger", action="store_true",
                     help="板子已经停在 Boot 升级窗口时加这个，不再发 'U'")
+    ap.add_argument("--corrupt", type=int, default=None, metavar="N",
+                    help="负面测试：把第 N 帧 DATA 的首字节翻转 1 bit（帧 CRC16 仍合法，整包 CRC32 会挂）")
+    ap.add_argument("--truncate", type=int, default=0, metavar="N",
+                    help="负面测试：故意少发最后 N 帧 DATA，触发 premature END")
     args = ap.parse_args()
 
     if args.bin:
@@ -225,8 +254,16 @@ def main():
     head, crc = make_image(fw, args.version)
     chunks = [fw[i:i + 128] for i in range(0, len(fw), 128)]
 
+    fault_mode = (args.corrupt is not None) or (args.truncate > 0)
+    if args.corrupt is not None and not (0 <= args.corrupt < len(chunks)):
+        print("--corrupt 必须在 0 ~ %d 之间" % (len(chunks) - 1))
+        return 1
+    if args.truncate and not (1 <= args.truncate < len(chunks)):
+        print("--truncate 必须在 1 ~ %d 之间" % (len(chunks) - 1))
+        return 1
+
     print("=" * 62)
-    print(" OTA 升级包")
+    print(" OTA 升级包%s" % ("（负面测试模式，故意失败）" if fault_mode else ""))
     print("   源      : %s" % (args.bin or args.hex))
     print("   固件长度: %d B (0x%X)，分 %d 帧" % (len(fw), len(fw), len(chunks)))
     print("   CRC32   : 0x%08X" % crc)
@@ -253,12 +290,39 @@ def main():
 
         print("[3/5] 发 DATA（每帧 128 B，逐帧等 ACK）...")
         t0 = time.time()
+        sent = 0
+        total = len(chunks) - args.truncate
         for seq, chunk in enumerate(chunks):
+            if args.truncate and seq >= total:
+                print("   ! 故意少发最后 %d 帧（--truncate）" % args.truncate)
+                break
+            if args.corrupt is not None and seq == args.corrupt:
+                bad = bytearray(chunk)
+                bad[0] ^= 0x01                  # 只翻 1 bit：帧 CRC16 重算后仍合法
+                chunk = bytes(bad)
+                print("   ! 故意翻转第 %d 帧的第 1 个 bit（--corrupt）" % seq)
+
             tail = send_frame(uart, tail, TYPE_DATA, seq, chunk, ACK, 3.0)
-            if (seq + 1) % 32 == 0 or seq + 1 == len(chunks):
+            sent += 1
+            if sent % 32 == 0 or sent == total:
                 print("   %4d/%4d 帧  %6d/%d B" %
-                      (seq + 1, len(chunks), min((seq + 1) * 128, len(fw)), len(fw)))
+                      (sent, len(chunks), min(sent * 128, len(fw)), len(fw)))
         print("   发送耗时 %.1f s" % (time.time() - t0))
+
+        if fault_mode:
+            print("[4/5] 负面测试：发 END 后只收日志，不等 DONE ...")
+            uart.write(build_frame(TYPE_END, sent, b""))
+            deadline = time.time() + 8.0
+            while time.time() < deadline:
+                tail = dump_plain(uart, tail, 0.01)
+
+            print("\n" + "=" * 62)
+            print(" 负面测试结束（这次失败是故意的）")
+            print("   期望：[OTA] CRC MISMATCH / premature END -> APP untouched")
+            print("   期望：[SAFE] app untouched, crc32 still ok -> fallback")
+            print("   期望：jumping to app... + 天气时钟界面照常亮起")
+            print("=" * 62)
+            return 0
 
         print("[4/5] 发 END，Boot 开始 CRC32 校验 + 擦写 APP（约 2~5 s）...")
         tail = send_frame(uart, tail, TYPE_END, len(chunks), b"", DONE, 30.0, retries=0)

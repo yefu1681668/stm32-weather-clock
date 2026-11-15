@@ -9,6 +9,10 @@
  *   算 CRC32；校验通过之后才允许擦内部 APP 区。这样也顺带拿到一个好处：
  *   传坏包 / 断线 / 中途断电，APP 区一个字节都没动，板子不会变砖。
  *
+ * 【第④步】提交成功后不把 boot_try 清 0，而是置 1：这份固件还没被证明
+ * 能启动。Boot 跳转前会累加它，APP 真正跑起来后由 app_boot_confirm() 清 0，
+ * 于是「刷了个一上电就死的新固件」不会无限重启，三次后自动停 Boot 等重升。
+ *
  * 【为什么帧内绝不 HAL_Delay】
  *   F1 的 USART 没有 FIFO，RXNE 只锁存 1 个字节。115200 下每 86.8 us 就来
  *   一个字节，一旦在收帧途中插入 10 ms 延时，后面的字节全部溢出丢失。
@@ -180,6 +184,14 @@ static int ota_commit(const ota_image_hdr_t *img, boot_param_t *param)
 
     boot_log("[OTA] crc32 ok, erasing APP 47 KB...\r\n");
 
+    /* 第④步：动手擦 APP 之前，先把「试跑中」写进账本。
+     * 万一擦到一半断电，重启后 Boot 看到 boot_try=1，连续试跑三次都失败
+     * 就自动停 Boot 等重升，不会抱着半截固件无限重启。
+     * 写失败只警告：CRC 已经过了，正常升级不该被账本问题拦住。 */
+    param->boot_try = 1;
+    if (!boot_param_write(param))
+        boot_log("[OTA] WARN: pre-erase param write failed\r\n");
+
     /* ② 擦【整个】APP 区，而不是只擦 length 覆盖的页。
      *    顺带把迁址前那版 48 KB 旧固件的残骸清干净 —— 11-14 日志里
      *    scan_end=47352 就是它造成的，升级后会变成真实长度。 */
@@ -220,11 +232,16 @@ static int ota_commit(const ota_image_hdr_t *img, boot_param_t *param)
     }
 
     /* ⑥ 记账。参数页在 0x0800FC00，和 APP 区不重叠。
-     *    写失败只警告：固件本身已经好了，账本坏了不影响这次启动。 */
+     *    写失败只警告：固件本身已经好了，账本坏了不影响这次启动。
+     *
+     *    第④步关键：boot_try 置 1 而不是 0 —— 表示「刚刷完，还没证明能跑」。
+     *    Boot 下次上电会把它加到 2 再跳，APP 启动成功后由 app_boot_confirm()
+     *    清回 0。如果新固件一上电就死，没人清它，三次之后 Boot 自动停住
+     *    等重新升级，避免无限重启变砖。 */
     param->upgrade_req = 0;
     param->app_size    = img->length;
     param->app_crc32   = img->crc32;
-    param->boot_try    = 0;
+    param->boot_try    = 1;
     if (!boot_param_write(param))
         boot_log("[OTA] WARN: param page write failed\r\n");
 

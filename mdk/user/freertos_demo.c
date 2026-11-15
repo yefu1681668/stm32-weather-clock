@@ -853,6 +853,12 @@ static void ui_task(void *pvParameters)
     ui_update_indoor();
     lcd_unlock();
 
+    /* OTA 第④步：屏幕首帧已经画出来，说明这份 APP 真的跑起来了。
+     * 通知 Boot 清掉 boot_try（只有刚升级完才非 0），否则 Boot 会以为
+     * 新固件启动失败，三次之后自动停在升级窗口。正常开机时这个函数
+     * 只读一次参数页、不擦写 Flash，开销可以忽略。 */
+    app_boot_confirm();
+
     /* W25Q 自检: 图标已外置, 这块 Flash 不通就画不出图标(失败时才提示)。
      * 放在 give 之前, 此时 net_task 还拿不到闸门、不会碰屏, 无需抢互斥量。 */
     w25q_boot_check();
